@@ -103,7 +103,7 @@ def check_xmodel(model_path):
 
 if __name__ == "__main__":
     # xmodel file path
-    model_path = "YOLOv8Wrapper_int.xmodel"
+    model_path = "yolov8n_kv260.xmodel"
     
     # Check DPU status
     print("\nChecking DPU status...")
