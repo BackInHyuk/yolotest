@@ -69,4 +69,4 @@ def test_inference(model_path):
             print("  → Looks like YOLOv8 detection output (4 bbox + 80 classes)")
 
 if __name__ == "__main__":
-    test_inference("YOLOv8Wrapper_int.xmodel")
+    test_inference("yolov8n_kv260.xmodel")
