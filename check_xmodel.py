@@ -69,18 +69,24 @@ def check_xmodel(model_path):
         input_dims = input_tensors[0].dims
         print(f"Input dims: {input_dims}")
         
-        # Create dummy input
+        # Create dummy data and copy to input buffer
         dummy_input = np.random.randint(0, 255, size=input_dims, dtype=np.uint8)
+        input_buffers[0][:] = dummy_data
         
         # Run inference
         print("Running inference...")
         start_time = time.time()
         
-        job_id = runner.execute_async([dummy_input], output_tensors)
-        runner.wait(job_id)
+        job_id = runner.execute_async(input_buffers, output_buffers)
+        runner.wait(job_id[0])
         
         inference_time = (time.time() - start_time) * 1000
         print(f"Inference completed! Time: {inference_time:.2f}ms")
+
+        # Check output
+        print("\nOutput buffer shapes:")
+        for i, buf in enumerate(output_buffers):    
+            print(f"  Output {i}: shape = {np.array(buf).shape}")
         
         print("\n" + "="*60)
         print("xmodel test completed! Model is working properly.")
