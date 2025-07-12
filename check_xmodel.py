@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-xmodel 파일 정보 확인 및 테스트
+xmodel file information check and test
 """
 
 import xir
@@ -10,112 +10,112 @@ import time
 
 def check_xmodel(model_path):
     print(f"\n{'='*60}")
-    print(f"xmodel 파일 분석: {model_path}")
+    print(f"Analyzing xmodel file: {model_path}")
     print(f"{'='*60}\n")
     
     try:
-        # 1. XIR 그래프 로드
-        print("[1] XIR 그래프 로드 중...")
+        # 1. Load XIR graph
+        print("[1] Loading XIR graph...")
         graph = xir.Graph.deserialize(model_path)
-        print("✓ 그래프 로드 성공!")
+        print("✓ Graph loaded successfully!")
         
-        # 2. 서브그래프 확인
-        print("\n[2] 서브그래프 분석...")
+        # 2. Check subgraphs
+        print("\n[2] Analyzing subgraphs...")
         subgraphs = graph.get_root_subgraph().toposort_child_subgraph()
-        print(f"✓ 전체 서브그래프 개수: {len(subgraphs)}")
+        print(f"✓ Total subgraphs: {len(subgraphs)}")
         
-        # 3. DPU 서브그래프 찾기
+        # 3. Find DPU subgraph
         dpu_subgraph = None
         for i, sg in enumerate(subgraphs):
-            print(f"\n  서브그래프 {i}: {sg.get_name()}")
+            print(f"\n  Subgraph {i}: {sg.get_name()}")
             if sg.has_attr("device"):
                 device = sg.get_attr("device")
                 print(f"    - Device: {device}")
                 if device.upper() == "DPU":
                     dpu_subgraph = sg
-                    print("    ✓ DPU 서브그래프 발견!")
+                    print("    ✓ DPU subgraph found!")
         
         if not dpu_subgraph:
-            print("\n❌ DPU 서브그래프를 찾을 수 없습니다!")
+            print("\n Cannot find DPU subgraph!")
             return
             
-        # 4. Runner 생성
-        print("\n[3] DPU Runner 생성...")
+        # 4. Create Runner
+        print("\n[3] Creating DPU Runner...")
         runner = vart.Runner.create_runner(dpu_subgraph, "run")
-        print("✓ Runner 생성 성공!")
+        print("✓ Runner created successfully!")
         
-        # 5. 입출력 텐서 정보
-        print("\n[4] 텐서 정보:")
+        # 5. Input/Output tensor information
+        print("\n[4] Tensor Information:")
         input_tensors = runner.get_input_tensors()
         output_tensors = runner.get_output_tensors()
         
-        print(f"\n입력 텐서 ({len(input_tensors)}개):")
+        print(f"\nInput Tensors ({len(input_tensors)}):")
         for i, tensor in enumerate(input_tensors):
             print(f"  [{i}] {tensor.name}")
             print(f"      - Shape: {tensor.shape}")
             print(f"      - Data Type: {tensor.get_data_type()}")
             
-        print(f"\n출력 텐서 ({len(output_tensors)}개):")
+        print(f"\nOutput Tensors ({len(output_tensors)}):")
         for i, tensor in enumerate(output_tensors):
             print(f"  [{i}] {tensor.name}")
             print(f"      - Shape: {tensor.shape}")
             print(f"      - Data Type: {tensor.get_data_type()}")
         
-        # 6. 더미 데이터로 추론 테스트
-        print("\n[5] 더미 데이터로 추론 테스트...")
+        # 6. Inference test with dummy data
+        print("\n[5] Testing inference with dummy data...")
         
-        # 입력 데이터 준비 (랜덤 이미지)
+        # Prepare input data (random image)
         input_shape = input_tensors[0].shape
-        print(f"입력 shape: {input_shape}")
+        print(f"Input shape: {input_shape}")
         
-        # 더미 입력 생성
+        # Create dummy input
         dummy_input = np.random.randint(0, 255, size=input_shape, dtype=np.uint8)
         
-        # 추론 실행
-        print("추론 실행 중...")
+        # Run inference
+        print("Running inference...")
         start_time = time.time()
         
         job_id = runner.execute_async([dummy_input], output_tensors)
         runner.wait(job_id)
         
         inference_time = (time.time() - start_time) * 1000
-        print(f"✓ 추론 완료! 소요 시간: {inference_time:.2f}ms")
+        print(f"✓ Inference completed! Time: {inference_time:.2f}ms")
         
-        # 출력 확인
-        print("\n[6] 출력 확인:")
+        # Check output
+        print("\n[6] Output Check:")
         for i, tensor in enumerate(output_tensors):
             output_data = np.array(tensor)
-            print(f"  출력 텐서 {i}: shape={output_data.shape}, dtype={output_data.dtype}")
+            print(f"  Output tensor {i}: shape={output_data.shape}, dtype={output_data.dtype}")
             print(f"  - Min: {output_data.min():.4f}, Max: {output_data.max():.4f}")
             print(f"  - Mean: {output_data.mean():.4f}, Std: {output_data.std():.4f}")
         
         print(f"\n{'='*60}")
-        print("✅ xmodel 테스트 완료! 모델이 정상적으로 작동합니다.")
+        print(" xmodel test completed! Model is working properly.")
         print(f"{'='*60}\n")
         
     except Exception as e:
-        print(f"\n❌ 오류 발생: {str(e)}")
-        print("\n가능한 원인:")
-        print("1. DPU가 로드되지 않았을 수 있습니다")
-        print("   → sudo xmutil loadapp b4096_300m")
-        print("2. xmodel 파일이 손상되었을 수 있습니다")
-        print("3. 필요한 라이브러리가 없을 수 있습니다")
+        print(f"\n Error occurred: {str(e)}")
+        print("\nPossible causes:")
+        print("1. DPU might not be loaded")
+        print("   → Run: sudo xmutil loadapp b4096_300m")
+        print("2. xmodel file might be corrupted")
+        print("3. Required libraries might be missing")
 
 if __name__ == "__main__":
-    # xmodel 파일 경로
+    # xmodel file path
     model_path = "YOLOv8Wrapper_int.xmodel"
     
-    # DPU 확인
-    print("\nDPU 상태 확인...")
+    # Check DPU status
+    print("\nChecking DPU status...")
     import subprocess
     try:
         result = subprocess.run(['dexplorer', '-w'], capture_output=True, text=True)
         if result.returncode == 0:
-            print("✓ DPU가 활성화되어 있습니다.")
+            print("✓ DPU is active.")
         else:
-            print("❌ DPU를 찾을 수 없습니다. 'sudo xmutil loadapp b4096_300m' 실행 필요")
+            print(" Cannot find DPU. Please run 'sudo xmutil loadapp b4096_300m'")
     except:
-        print("⚠️  dexplorer 명령을 실행할 수 없습니다.")
+        print("  Cannot execute dexplorer command.")
     
-    # xmodel 테스트
+    # Test xmodel
     check_xmodel(model_path)
