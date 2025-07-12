@@ -68,9 +68,13 @@ def check_xmodel(model_path):
         
         input_dims = input_tensors[0].dims
         print(f"Input dims: {input_dims}")
+
+        # Get input/output buffers from runner
+        input_buffers = runner.get_inputs()
+        output_buffers = runner.get_outputs()
         
         # Create dummy data and copy to input buffer
-        dummy_input = np.random.randint(0, 255, size=input_dims, dtype=np.uint8)
+        dummy_data = np.random.randint(0, 255, size=input_dims, dtype=np.uint8)
         input_buffers[0][:] = dummy_data
         
         # Run inference
