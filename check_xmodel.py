@@ -25,7 +25,7 @@ def check_xmodel(model_path):
         subgraphs = graph.get_root_subgraph().toposort_child_subgraph()
         print(f"Total subgraphs: {len(subgraphs)}")
         
-        # 3. List ALL subgraphs
+        # 3. List ALL subgraphs and find the DPU subgraph
         dpu_subgraph = None
         for i, sg in enumerate(subgraphs):
             print(f"\n  Subgraph {i}: {sg.get_name()}")
@@ -55,7 +55,6 @@ def check_xmodel(model_path):
             print(f"  [{i}] {tensor.name}")
             dims = tensor.dims
             print(f"      - Dims: {dims}")
-            # Remove get_data_type() call
             
         print(f"\nOutput Tensors ({len(output_tensors)}):")
         for i, tensor in enumerate(output_tensors):
@@ -69,28 +68,37 @@ def check_xmodel(model_path):
         input_dims = input_tensors[0].dims
         print(f"Input dims: {input_dims}")
 
-        # Get input/output buffers from runner
-        input_buffers = runner.get_inputs()
-        output_buffers = runner.get_outputs()
+        # --- FIX START ---
+        # The methods get_inputs() and get_outputs() are deprecated.
+        # Instead, create numpy arrays for input and output data directly.
         
-        # Create dummy data and copy to input buffer
-        dummy_data = np.random.randint(0, 255, size=input_dims, dtype=np.uint8)
-        input_buffers[0][:] = dummy_data
+        # Create a numpy array for the input data.
+        # This list will be passed to execute_async.
+        input_data = [np.random.randint(0, 255, size=input_dims, dtype=np.uint8)]
+        
+        # Create a list of empty numpy arrays for the runner to fill with output data.
+        # The shape and dtype should match the model's output tensors.
+        # For YOLO, output is typically float32.
+        output_data = [np.empty(tensor.dims, dtype=np.float32) for tensor in output_tensors]
         
         # Run inference
         print("Running inference...")
         start_time = time.time()
         
-        job_id = runner.execute_async(input_buffers, output_buffers)
-        runner.wait(job_id[0])
+        # Pass the lists of numpy arrays directly to execute_async.
+        # It returns a single job ID (integer).
+        job_id = runner.execute_async(input_data, output_data)
+        runner.wait(job_id) # Wait for the job to complete
         
         inference_time = (time.time() - start_time) * 1000
         print(f"Inference completed! Time: {inference_time:.2f}ms")
 
         # Check output
         print("\nOutput buffer shapes:")
-        for i, buf in enumerate(output_buffers):    
-            print(f"  Output {i}: shape = {np.array(buf).shape}")
+        # Iterate through the output_data list we created.
+        for i, buf in enumerate(output_data):   
+            print(f"  Output {i}: shape = {buf.shape}")
+        # --- FIX END ---
         
         print("\n" + "="*60)
         print("xmodel test completed! Model is working properly.")
@@ -109,4 +117,8 @@ if __name__ == "__main__":
         print("/dev/dpu not found")
         
     # Test model
-    check_xmodel("yolov8n_kv260.xmodel")
+    model_file = "yolov8n_kv260.xmodel"
+    if not os.path.exists(model_file):
+        print(f"Error: Model file not found at {model_file}")
+    else:
+        check_xmodel(model_file)
