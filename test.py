@@ -48,7 +48,7 @@ class YOLOv8_DPU:
         Initializes the DPU runner for the YOLOv8 model.
         """
         if not pathlib.Path(model_path).exists():
-            raise FileNotFoundError(f"Model file not found at {model_path}")
+            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
 
         # Create the DPU runner
         self.runner = vart.Runner.create_runner(pathlib.Path(model_path), "run")
@@ -69,11 +69,11 @@ class YOLOv8_DPU:
         # Get model input shape
         self.input_shape = tuple(self.input_tensor.dims) # e.g., (1, 640, 640, 3)
         
-        print(f"DPU Initialized:")
-        print(f"  - Model: {model_path}")
-        print(f"  - Input Shape: {self.input_shape}")
-        print(f"  - Input Scale: {self.input_scale}")
-        print(f"  - Output Scale: {self.output_scale}")
+        print(f"DPU가 초기화되었습니다:")
+        print(f"  - 모델: {model_path}")
+        print(f"  - 입력 형태: {self.input_shape}")
+        print(f"  - 입력 스케일: {self.input_scale}")
+        print(f"  - 출력 스케일: {self.output_scale}")
 
 
     def preprocess(self, frame):
@@ -209,21 +209,21 @@ def capture_frames():
     try:
         yolo_detector = YOLOv8_DPU(MODEL_PATH)
     except Exception as e:
-        print(f"Error initializing DPU: {e}")
-        print("Streaming will show raw camera feed without detections.")
+        print(f"DPU 초기화 오류: {e}")
+        print("탐지 기능 없이 원본 카메라 영상만 스트리밍합니다.")
         yolo_detector = None
 
     # Initialize video capture
     cap = cv2.VideoCapture(CAMERA_DEVICE)
     if not cap.isOpened():
-        print(f"Error: Could not open camera device {CAMERA_DEVICE}")
+        print(f"오류: 카메라 장치({CAMERA_DEVICE})를 열 수 없습니다.")
         return
 
-    print("Starting camera capture...")
+    print("카메라 캡처를 시작합니다...")
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Warning: Failed to grab frame, retrying...")
+            print("경고: 프레임을 가져오지 못했습니다. 재시도합니다...")
             time.sleep(0.1)
             continue
         
@@ -232,7 +232,7 @@ def capture_frames():
             try:
                 processed_frame = yolo_detector.run(frame)
             except Exception as e:
-                print(f"Error during inference: {e}")
+                print(f"추론 중 오류 발생: {e}")
                 processed_frame = frame # Fallback to original frame on error
         else:
             processed_frame = frame
@@ -299,18 +299,16 @@ def index():
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    # Check if model path is set
-    if MODEL_PATH == "yolov8n_kv260.xmodel":
-        print("\n" + "="*50)
-        print("!!! IMPORTANT: Please edit this script and set the 'MODEL_PATH' variable !!!")
-        print("="*50 + "\n")
-        exit(1)
-        
+    # The script will now directly attempt to load the model.
+    # If MODEL_PATH is incorrect or the file doesn't exist,
+    # a FileNotFoundError will be raised inside the capture_frames thread, 
+    # which is more descriptive.
+    
     # Start the background thread for frame capture and inference
     capture_thread = threading.Thread(target=capture_frames)
     capture_thread.daemon = True
     capture_thread.start()
     
     # Run Flask web server
-    print("Starting Flask server... Access at http://<your_kv260_ip>:5000")
+    print("Flask 서버를 시작합니다... http://<your_kv260_ip>:5000 에서 접속하세요.")
     app.run(host='0.0.0.0', port=5000, threaded=True)
