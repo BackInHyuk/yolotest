@@ -15,7 +15,7 @@ import pathlib
 import os
 
 # --- Configuration ---
-MODEL_PATH = "/path/to/your/yolov8n.xmodel" # IMPORTANT: Set the correct path to your compiled model
+MODEL_PATH = "yolov8n_kv260.xmodel" # IMPORTANT: Set the correct path to your compiled model
 CAMERA_DEVICE = 0 # Camera device index (e.g., 0, 1, or a video file path)
 CONF_THRESHOLD = 0.5 # Confidence threshold for displaying detections
 NMS_THRESHOLD = 0.4 # Non-Maximum Suppression threshold
@@ -300,7 +300,7 @@ def index():
 # --- Main Execution ---
 if __name__ == '__main__':
     # Check if model path is set
-    if MODEL_PATH == "/path/to/your/yolov8n.xmodel":
+    if MODEL_PATH == "yolov8n_kv260.xmodel":
         print("\n" + "="*50)
         print("!!! IMPORTANT: Please edit this script and set the 'MODEL_PATH' variable !!!")
         print("="*50 + "\n")
