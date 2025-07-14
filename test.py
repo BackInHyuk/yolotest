@@ -17,14 +17,12 @@ import os
 # --- Configuration ---
 MODEL_PATH = "yolov8n_kv260.xmodel" # IMPORTANT: Set the correct path to your compiled model
 CAMERA_DEVICE = 0 # Camera device index (e.g., 0, 1, or a video file path)
-# --- DEBUGGING: Lowered threshold to see if any weak detections appear ---
-CONF_THRESHOLD = 0.2 # Confidence threshold for displaying detections (기존 0.5에서 하향 조정)
+CONF_THRESHOLD = 0.2 # Confidence threshold for displaying detections
 NMS_THRESHOLD = 0.4 # Non-Maximum Suppression threshold
 INPUT_WIDTH = 640 # YOLOv8 model input width
 INPUT_HEIGHT = 640 # YOLOv8 model input height
 
 # --- COCO Class Names ---
-# This list should match the classes the model was trained on.
 COCO_CLASSES = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
     "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
@@ -51,59 +49,35 @@ class YOLOv8_DPU:
         if not pathlib.Path(model_path).exists():
             raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
 
-        # Create the DPU runner
         self.runner = vart.Runner.create_runner(pathlib.Path(model_path), "run")
-        
-        # Get input and output tensor details
         input_tensors = self.runner.get_input_tensors()
         output_tensors = self.runner.get_output_tensors()
-        
         self.input_tensor = input_tensors[0]
         self.output_tensor = output_tensors[0]
-
-        # Get input scaling factor
         self.input_scale = vart.get_input_scale(self.input_tensor)
-        
-        # Get output scaling factor
         self.output_scale = vart.get_output_scale(self.output_tensor)
-
-        # Get model input shape
-        self.input_shape = tuple(self.input_tensor.dims) # e.g., (1, 640, 640, 3)
+        self.input_shape = tuple(self.input_tensor.dims)
         
         print(f"DPU가 초기화되었습니다:")
         print(f"  - 모델: {model_path}")
         print(f"  - 입력 형태: {self.input_shape}")
+        print(f"  - 출력 형태: {self.output_tensor.dims}")
         print(f"  - 입력 스케일: {self.input_scale}")
         print(f"  - 출력 스케일: {self.output_scale}")
-
 
     def preprocess(self, frame):
         """
         Preprocesses a single frame for YOLOv8 inference.
-        - Resizes the image to the model's input dimensions.
-        - Normalizes pixel values.
-        - Adds a batch dimension.
         """
-        # Resize the frame to the model's input size
         img = cv2.resize(frame, (self.input_shape[2], self.input_shape[1]))
-        
-        # Normalize and scale
         img = (img * self.input_scale).astype(np.int8)
-
-        # Add batch dimension
         return np.expand_dims(img, 0)
 
     def postprocess(self, dpu_output, original_shape):
         """
         Postprocesses the DPU output to get bounding boxes.
-        - Decodes the output tensor.
-        - Applies Non-Maximum Suppression (NMS).
-        - Scales boxes to the original frame size.
         """
         h, w = original_shape
-        
-        # The output tensor from YOLOv8 DPU is typically (1, 8400, 85)
-        # where 85 = 4 (box) + 1 (confidence) + 80 (class scores)
         predictions = dpu_output.reshape(1, -1, len(COCO_CLASSES) + 4)[0]
         
         boxes = []
@@ -120,26 +94,21 @@ class YOLOv8_DPU:
             class_scores = pred[5:]
             class_id = np.argmax(class_scores)
             max_class_score = class_scores[class_id]
-            
             final_conf = obj_conf * max_class_score
+            
             if final_conf > CONF_THRESHOLD:
                 cx, cy, bw, bh = box
-                
                 x = int((cx - bw / 2) * w)
                 y = int((cy - bh / 2) * h)
                 width = int(bw * w)
                 height = int(bh * h)
-
                 boxes.append([x, y, width, height])
                 confidences.append(float(final_conf))
                 class_ids.append(class_id)
 
-        # --- DEBUGGING: Print number of raw detections before NMS ---
-        # 주석을 해제하면 터미널에서 탐지된 박스 개수를 확인할 수 있습니다.
         if len(boxes) > 0:
             print(f"임계값({CONF_THRESHOLD})을 넘은 박스 {len(boxes)}개 발견 (NMS 적용 전)")
 
-        # Apply Non-Maximum Suppression
         indices = cv2.dnn.NMSBoxes(boxes, confidences, CONF_THRESHOLD, NMS_THRESHOLD)
         
         final_detections = []
@@ -161,17 +130,10 @@ class YOLOv8_DPU:
             x, y, w, h = box
             class_id = det["class_id"]
             confidence = det["confidence"]
-            
             label = f"{COCO_CLASSES[class_id]}: {confidence:.2f}"
-            
-            # Draw rectangle
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            
-            # Draw label background
             (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(frame, (x, y - label_h - 10), (x + label_w, y), (0, 255, 0), cv2.FILLED)
-            
-            # Draw label text
             cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
         return frame
 
@@ -187,7 +149,19 @@ class YOLOv8_DPU:
         job_id = self.runner.execute_async(input_data, output_data)
         self.runner.wait(job_id)
 
-        detections = self.postprocess(output_data[0] * self.output_scale, original_shape)
+        # --- [NEW] RAW OUTPUT DEBUGGING ---
+        # DPU의 원시 출력값을 직접 확인하여 모델이 유효한 값을 생성하는지 검사합니다.
+        raw_output = output_data[0] * self.output_scale
+        
+        # 모든 8400개의 예측 중에서 가장 높은 객체 신뢰도 점수를 찾습니다.
+        # 이 값이 매우 낮다면(예: 0.001 이하), 모델 자체가 객체를 탐지하지 못하는 것입니다.
+        # YOLOv8 출력 형식: [cx, cy, w, h, obj_conf, class_scores...]
+        max_obj_confidence = np.max(raw_output[0, :, 4])
+        
+        print(f"[DPU RAW OUTPUT DEBUG] Shape: {raw_output.shape}, Max Obj Conf: {max_obj_confidence:.6f}, Min Val: {np.min(raw_output):.4f}, Max Val: {np.max(raw_output):.4f}")
+        # --- END OF DEBUGGING CODE ---
+
+        detections = self.postprocess(raw_output, original_shape)
         processed_frame = self.draw_detections(frame, detections)
         
         return processed_frame
@@ -195,7 +169,6 @@ class YOLOv8_DPU:
 # --- Frame Capture Thread ---
 def capture_frames():
     global output_frame, lock
-
     try:
         yolo_detector = YOLOv8_DPU(MODEL_PATH)
     except Exception as e:
@@ -233,7 +206,6 @@ def capture_frames():
 # --- MJPEG Streaming Generator ---
 def generate():
     global output_frame, lock
-    
     while True:
         with lock:
             if output_frame is None:
@@ -241,35 +213,24 @@ def generate():
             ret, jpeg = cv2.imencode('.jpg', output_frame)
             if not ret:
                 continue
-        
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        
         time.sleep(1/30)
 
 # --- Flask Routes ---
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/')
 def index():
-    """Video streaming home page."""
     html_page = """
     <html>
-        <head>
-            <title>YOLOv8 DPU Live Stream</title>
+        <head><title>YOLOv8 DPU Live Stream</title>
             <style>
                 body { font-family: sans-serif; text-align: center; background-color: #282c34; color: white; }
                 h1 { margin-top: 20px; }
-                img { 
-                    margin-top: 20px; 
-                    border: 5px solid #61dafb;
-                    border-radius: 10px;
-                    background-color: #000;
-                    max-width: 90%;
-                }
+                img { margin-top: 20px; border: 5px solid #61dafb; border-radius: 10px; background-color: #000; max-width: 90%; }
             </style>
         </head>
         <body>
