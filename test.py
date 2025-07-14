@@ -11,6 +11,7 @@ import threading
 import time
 import numpy as np
 import vart
+import xir # VART 실행기 생성을 위해 xir 라이브러리 추가
 import pathlib
 import os
 
@@ -45,11 +46,24 @@ class YOLOv8_DPU:
     def __init__(self, model_path):
         """
         Initializes the DPU runner for the YOLOv8 model.
+        Uses a more robust method to be compatible with different VART versions.
         """
         if not pathlib.Path(model_path).exists():
             raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
 
-        self.runner = vart.Runner.create_runner(pathlib.Path(model_path), "run")
+        # --- [MODIFIED] DPU Runner Initialization ---
+        # 모델 그래프를 가져옵니다.
+        g = xir.Graph.deserialize(model_path)
+        # 그래프에서 DPU용 서브그래프를 찾습니다.
+        subgraphs = g.get_root_subgraph().get_children()
+        dpu_subgraph = [s for s in subgraphs if s.get_attr("device") == "DPU"]
+        if not dpu_subgraph:
+            raise RuntimeError("모델에서 DPU 서브그래프를 찾을 수 없습니다.")
+        
+        # DPU 서브그래프를 사용하여 VART 실행기를 생성합니다.
+        self.runner = vart.Runner.create_runner(dpu_subgraph[0], "run")
+        # --- END OF MODIFICATION ---
+        
         input_tensors = self.runner.get_input_tensors()
         output_tensors = self.runner.get_output_tensors()
         self.input_tensor = input_tensors[0]
@@ -141,9 +155,7 @@ class YOLOv8_DPU:
         """
         Runs the full pipeline: preprocess, inference, postprocess, draw.
         """
-        # --- [NEW] DEBUGGING: Check if this method is being called ---
         print("[DEBUG] Entering yolo_detector.run()", flush=True)
-        # --- END OF DEBUGGING CODE ---
 
         original_shape = frame.shape[:2]
         preprocessed_frame = self.preprocess(frame)
@@ -153,15 +165,11 @@ class YOLOv8_DPU:
         job_id = self.runner.execute_async(input_data, output_data)
         self.runner.wait(job_id)
 
-        # --- [MODIFIED] RAW OUTPUT DEBUGGING ---
-        # DPU의 원시 출력값을 직접 확인하여 모델이 유효한 값을 생성하는지 검사합니다.
         raw_output = output_data[0] * self.output_scale
         
         max_obj_confidence = np.max(raw_output[0, :, 4])
         
-        # flush=True를 추가하여 출력이 즉시 터미널에 표시되도록 합니다.
         print(f"[DPU RAW OUTPUT DEBUG] Shape: {raw_output.shape}, Max Obj Conf: {max_obj_confidence:.6f}, Min Val: {np.min(raw_output):.4f}, Max Val: {np.max(raw_output):.4f}", flush=True)
-        # --- END OF MODIFICATION ---
 
         detections = self.postprocess(raw_output, original_shape)
         processed_frame = self.draw_detections(frame, detections)
@@ -174,8 +182,11 @@ def capture_frames():
     try:
         yolo_detector = YOLOv8_DPU(MODEL_PATH)
     except Exception as e:
-        print(f"DPU 초기화 오류: {e}")
-        print("탐지 기능 없이 원본 카메라 영상만 스트리밍합니다.")
+        # 오류 메시지를 더 자세히 출력하도록 수정
+        print(f"DPU 초기화 중 심각한 오류 발생: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        print("탐지 기능 없이 원본 카메라 영상만 스트리밍합니다.", flush=True)
         yolo_detector = None
 
     cap = cv2.VideoCapture(CAMERA_DEVICE)
