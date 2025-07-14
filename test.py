@@ -17,7 +17,8 @@ import os
 # --- Configuration ---
 MODEL_PATH = "yolov8n_kv260.xmodel" # IMPORTANT: Set the correct path to your compiled model
 CAMERA_DEVICE = 0 # Camera device index (e.g., 0, 1, or a video file path)
-CONF_THRESHOLD = 0.5 # Confidence threshold for displaying detections
+# --- DEBUGGING: Lowered threshold to see if any weak detections appear ---
+CONF_THRESHOLD = 0.2 # Confidence threshold for displaying detections (기존 0.5에서 하향 조정)
 NMS_THRESHOLD = 0.4 # Non-Maximum Suppression threshold
 INPUT_WIDTH = 640 # YOLOv8 model input width
 INPUT_HEIGHT = 640 # YOLOv8 model input height
@@ -110,27 +111,20 @@ class YOLOv8_DPU:
         class_ids = []
 
         for pred in predictions:
-            # The first 4 values are box coordinates (cx, cy, w, h)
-            # The 5th value is the object confidence score
-            # The rest are class scores
-            
             box = pred[:4]
             obj_conf = pred[4]
             
             if obj_conf < CONF_THRESHOLD:
                 continue
             
-            # Find the class with the highest score
             class_scores = pred[5:]
             class_id = np.argmax(class_scores)
             max_class_score = class_scores[class_id]
             
-            # Final confidence is obj_conf * max_class_score
             final_conf = obj_conf * max_class_score
             if final_conf > CONF_THRESHOLD:
                 cx, cy, bw, bh = box
                 
-                # Convert from center coordinates to x1, y1
                 x = int((cx - bw / 2) * w)
                 y = int((cy - bh / 2) * h)
                 width = int(bw * w)
@@ -139,6 +133,11 @@ class YOLOv8_DPU:
                 boxes.append([x, y, width, height])
                 confidences.append(float(final_conf))
                 class_ids.append(class_id)
+
+        # --- DEBUGGING: Print number of raw detections before NMS ---
+        # 주석을 해제하면 터미널에서 탐지된 박스 개수를 확인할 수 있습니다.
+        if len(boxes) > 0:
+            print(f"임계값({CONF_THRESHOLD})을 넘은 박스 {len(boxes)}개 발견 (NMS 적용 전)")
 
         # Apply Non-Maximum Suppression
         indices = cv2.dnn.NMSBoxes(boxes, confidences, CONF_THRESHOLD, NMS_THRESHOLD)
@@ -181,22 +180,14 @@ class YOLOv8_DPU:
         Runs the full pipeline: preprocess, inference, postprocess, draw.
         """
         original_shape = frame.shape[:2]
-        
-        # Preprocess the frame
         preprocessed_frame = self.preprocess(frame)
-
-        # Prepare input/output buffers
         input_data = [preprocessed_frame]
         output_data = [np.empty(self.output_tensor.dims, dtype=np.float32)]
 
-        # Execute the model on DPU
         job_id = self.runner.execute_async(input_data, output_data)
         self.runner.wait(job_id)
 
-        # Postprocess the output
         detections = self.postprocess(output_data[0] * self.output_scale, original_shape)
-
-        # Draw the results on the original frame
         processed_frame = self.draw_detections(frame, detections)
         
         return processed_frame
@@ -205,7 +196,6 @@ class YOLOv8_DPU:
 def capture_frames():
     global output_frame, lock
 
-    # Initialize YOLOv8 DPU handler
     try:
         yolo_detector = YOLOv8_DPU(MODEL_PATH)
     except Exception as e:
@@ -213,7 +203,6 @@ def capture_frames():
         print("탐지 기능 없이 원본 카메라 영상만 스트리밍합니다.")
         yolo_detector = None
 
-    # Initialize video capture
     cap = cv2.VideoCapture(CAMERA_DEVICE)
     if not cap.isOpened():
         print(f"오류: 카메라 장치({CAMERA_DEVICE})를 열 수 없습니다.")
@@ -227,17 +216,15 @@ def capture_frames():
             time.sleep(0.1)
             continue
         
-        # If DPU is initialized, run inference
         if yolo_detector:
             try:
                 processed_frame = yolo_detector.run(frame)
             except Exception as e:
                 print(f"추론 중 오류 발생: {e}")
-                processed_frame = frame # Fallback to original frame on error
+                processed_frame = frame 
         else:
             processed_frame = frame
 
-        # Update global frame
         with lock:
             output_frame = processed_frame.copy()
     
@@ -251,18 +238,14 @@ def generate():
         with lock:
             if output_frame is None:
                 continue
-            
-            # Encode frame as JPEG
             ret, jpeg = cv2.imencode('.jpg', output_frame)
             if not ret:
                 continue
         
-        # Return as MJPEG stream part
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
         
-        # Control frame rate
-        time.sleep(1/30) # Limit to ~30 FPS
+        time.sleep(1/30)
 
 # --- Flask Routes ---
 @app.route('/video_feed')
@@ -299,16 +282,9 @@ def index():
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    # The script will now directly attempt to load the model.
-    # If MODEL_PATH is incorrect or the file doesn't exist,
-    # a FileNotFoundError will be raised inside the capture_frames thread, 
-    # which is more descriptive.
-    
-    # Start the background thread for frame capture and inference
     capture_thread = threading.Thread(target=capture_frames)
     capture_thread.daemon = True
     capture_thread.start()
     
-    # Run Flask web server
     print("Flask 서버를 시작합니다... http://<your_kv260_ip>:5000 에서 접속하세요.")
     app.run(host='0.0.0.0', port=5000, threaded=True)
