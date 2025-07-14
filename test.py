@@ -107,7 +107,7 @@ class YOLOv8_DPU:
                 class_ids.append(class_id)
 
         if len(boxes) > 0:
-            print(f"임계값({CONF_THRESHOLD})을 넘은 박스 {len(boxes)}개 발견 (NMS 적용 전)")
+            print(f"임계값({CONF_THRESHOLD})을 넘은 박스 {len(boxes)}개 발견 (NMS 적용 전)", flush=True)
 
         indices = cv2.dnn.NMSBoxes(boxes, confidences, CONF_THRESHOLD, NMS_THRESHOLD)
         
@@ -141,6 +141,10 @@ class YOLOv8_DPU:
         """
         Runs the full pipeline: preprocess, inference, postprocess, draw.
         """
+        # --- [NEW] DEBUGGING: Check if this method is being called ---
+        print("[DEBUG] Entering yolo_detector.run()", flush=True)
+        # --- END OF DEBUGGING CODE ---
+
         original_shape = frame.shape[:2]
         preprocessed_frame = self.preprocess(frame)
         input_data = [preprocessed_frame]
@@ -149,17 +153,15 @@ class YOLOv8_DPU:
         job_id = self.runner.execute_async(input_data, output_data)
         self.runner.wait(job_id)
 
-        # --- [NEW] RAW OUTPUT DEBUGGING ---
+        # --- [MODIFIED] RAW OUTPUT DEBUGGING ---
         # DPU의 원시 출력값을 직접 확인하여 모델이 유효한 값을 생성하는지 검사합니다.
         raw_output = output_data[0] * self.output_scale
         
-        # 모든 8400개의 예측 중에서 가장 높은 객체 신뢰도 점수를 찾습니다.
-        # 이 값이 매우 낮다면(예: 0.001 이하), 모델 자체가 객체를 탐지하지 못하는 것입니다.
-        # YOLOv8 출력 형식: [cx, cy, w, h, obj_conf, class_scores...]
         max_obj_confidence = np.max(raw_output[0, :, 4])
         
-        print(f"[DPU RAW OUTPUT DEBUG] Shape: {raw_output.shape}, Max Obj Conf: {max_obj_confidence:.6f}, Min Val: {np.min(raw_output):.4f}, Max Val: {np.max(raw_output):.4f}")
-        # --- END OF DEBUGGING CODE ---
+        # flush=True를 추가하여 출력이 즉시 터미널에 표시되도록 합니다.
+        print(f"[DPU RAW OUTPUT DEBUG] Shape: {raw_output.shape}, Max Obj Conf: {max_obj_confidence:.6f}, Min Val: {np.min(raw_output):.4f}, Max Val: {np.max(raw_output):.4f}", flush=True)
+        # --- END OF MODIFICATION ---
 
         detections = self.postprocess(raw_output, original_shape)
         processed_frame = self.draw_detections(frame, detections)
@@ -193,7 +195,7 @@ def capture_frames():
             try:
                 processed_frame = yolo_detector.run(frame)
             except Exception as e:
-                print(f"추론 중 오류 발생: {e}")
+                print(f"추론 중 오류 발생: {e}", flush=True)
                 processed_frame = frame 
         else:
             processed_frame = frame
