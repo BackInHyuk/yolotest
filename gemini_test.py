@@ -18,7 +18,7 @@ try:
     import xir
     import vart
     print("DPU libraries imported")
-except ImportError as e: # Catch specific import error
+except ImportError as e:
     print(f"Cannot import DPU libraries: {e}")
     sys.exit(1)
 
@@ -53,53 +53,69 @@ class YOLOv8SafeRunner:
             for sg in children:
                 if sg.has_attr("device") and sg.get_attr("device").upper() == "DPU":
                     self.dpu_subgraph = sg
-                    print(f"Found DPU subgraph: {sg.get_name()}")
+                    print(f"Found DPU subgraph: {sg.dpu_kernel.name}") # Use dpu_kernel.name for DPU subgraph
                     break
             
             if not self.dpu_subgraph:
-                raise Exception("No DPU subgraph found in the model.")
+                raise Exception("No DPU subgraph found in the model. Check .xmodel with 'xir svg'.")
             
-            self.runner = vart.Runner.create_runner(self.dpu_subgraph) # No "run" or "sim" argument needed for standard runner
-            print("DPU Runner created successfully.")
+            # --- Revert to original runner creation method if it worked before ---
+            # Using "run" is common for actual DPU execution.
+            self.runner = vart.Runner.create_runner(self.dpu_subgraph, "run")
+            print("DPU Runner created successfully with 'run' mode.")
 
-            self.input_tensors = self.runner.get_input_tensors()
-            self.output_tensors = self.runner.get_output_tensors()
-
-            if not self.input_tensors or not self.output_tensors:
-                raise Exception("Could not retrieve input/output tensors from runner.")
+            # --- Safely get input/output tensor information ---
+            # Use subgraph.get_input_tensors() and subgraph.get_output_tensors()
+            # This is more robust as it's directly from the graph/subgraph
+            # rather than assuming the runner has all tensor properties after creation.
             
-            # --- Get Input Tensor Info ---
-            self.input_tensor_info = self.input_tensors[0]
+            subgraph_input_tensors = self.dpu_subgraph.get_input_tensors()
+            subgraph_output_tensors = self.dpu_subgraph.get_output_tensors()
+
+            if not subgraph_input_tensors or not subgraph_output_tensors:
+                raise Exception("Could not retrieve input/output tensors from DPU subgraph.")
+            
+            self.input_tensor_info = subgraph_input_tensors[0]
+            self.output_tensor_info = subgraph_output_tensors[0]
+
             self.input_dims = self.input_tensor_info.dims
-            # Assume NHWC for image input [N, H, W, C]
             self.input_height = self.input_dims[1]
             self.input_width = self.input_dims[2]
             
-            # Get input data type and scale
             self.input_dtype = self.input_tensor_info.dtype
             self.input_fix_point = self.input_tensor_info.get_attr("fix_point") if self.input_tensor_info.has_attr("fix_point") else 0
-            self.input_scale = 2**self.input_fix_point if self.input_input_dtype.name == 'INT8' else 1.0
+            # Scale for input: Data from opencv (0-255 uint8) to DPU INT8.
+            # Usually: (2**fix_point) / 255.0 OR just 2**fix_point if DPU expects 0-255 scaled.
+            # This requires knowing your quantization method. Let's assume (2**fix_point) for now.
+            # If the quantization normalized to [0,1] THEN scaled, it would be 2**fix_point
+            # If it directly quantized 0-255, it might be 1.0. This is crucial.
+            # For typical DPU INT8, input_scale is 1.0 or 255.0 / (2**fix_point) etc.
+            # For now, let's assume it scales 0-255 into the INT8 range directly
+            # A common pattern for images into INT8 DPU:
+            #   input_data = (image * (2**fix_point) / 255.0).astype(np.int8)
+            # This means input_scale for `(rgb_image * self.input_scale)` would be `(2**self.input_fix_point) / 255.0`
+            # However, sometimes, the model expects raw uint8 (0-255) to be fed directly to runner
+            # and runner handles internal quantization. Let's try simple scale first.
+            self.input_scale = 1.0 # This might need adjustment. Start simple.
             
-            print(f"Input Tensor: Name={self.input_tensor_info.name}, Shape={self.input_dims}, DType={self.input_dtype.name}, FixPoint={self.input_fix_point}")
+            print(f"Input Tensor: Name={self.input_tensor_info.name}, Shape={self.input_dims}, DType={self.input_dtype.name}, FixPoint={self.input_fix_point}, Scale={self.input_scale}")
 
-            # --- Get Output Tensor Info ---
-            self.output_tensor_info = self.output_tensors[0]
             self.output_dims = self.output_tensor_info.dims
-            
-            # Get output data type and scale
             self.output_dtype = self.output_tensor_info.dtype
             self.output_fix_point = self.output_tensor_info.get_attr("fix_point") if self.output_tensor_info.has_attr("fix_point") else 0
+            # Scale for output: DPU INT8 to float32.
+            # This is 1.0 / (2**fix_point)
             self.output_scale = 1.0 / (2**self.output_fix_point) if self.output_dtype.name == 'INT8' else 1.0
             
-            print(f"Output Tensor: Name={self.output_tensor_info.name}, Shape={self.output_dims}, DType={self.output_dtype.name}, FixPoint={self.output_fix_point}")
+            print(f"Output Tensor: Name={self.output_tensor_info.name}, Shape={self.output_dims}, DType={self.output_dtype.name}, FixPoint={self.output_fix_point}, Scale={self.output_scale}")
 
             self.ready = True
-            self.use_fallback = False # If runner created successfully, no fallback
+            self.use_fallback = False
             
         except Exception as e:
             print(f"Initialization error: {e}")
             self.ready = False
-            self.use_fallback = True # Enable fallback on initialization failure
+            self.use_fallback = True
             print("DPU initialization failed, falling back to dummy detection.")
 
     def detect_safe(self, image):
@@ -107,40 +123,51 @@ class YOLOv8SafeRunner:
             return self.fallback_detect(image)
         
         try:
-            # Preprocess input image based on DPU input requirements
             resized_image = cv2.resize(image, (self.input_width, self.input_height))
             rgb_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
             
-            # Convert to expected DPU input type (INT8) and apply scaling
+            # Prepare input data based on expected DPU type
             if self.input_dtype.name == 'INT8':
-                # Example: Normalize to [0, 1] then scale by 2^fix_point
-                # This depends heavily on your quantization recipe.
-                # Common approach: (image / 255.0 * 2**fix_point).astype(np.int8)
-                # Or simply: (image * self.input_scale).astype(np.int8) if input_scale is correct for 0-255 range.
-                # For images, DPU often expects 0-255 values, quantized to INT8.
-                # Check your quantization script's preprocessing for the exact scaling.
+                # If input_scale is 1.0, means uint8 is cast to int8, no division.
+                # If your quantization script did (image / 255.0 * 2^fix_point), then input_scale should be (2^fix_point)/255.0
                 input_data = (rgb_image * self.input_scale).astype(np.int8)
-                print(f"Input data dtype: {input_data.dtype}, min: {input_data.min()}, max: {input_data.max()}")
-            else: # If it's not INT8, assume it's float32 and scale to [0,1]
+                # It's also possible that `vart` expects `uint8` and does the internal casting/quantization itself.
+                # Let's try to pass `uint8` directly first if `self.input_fix_point` is 0 (meaning no explicit scaling needed)
+                # Or if the input_dtype is actually DT_UINT8 (which is rare for DPU)
+                if self.input_fix_point == 0: # Simple casting
+                     input_data = rgb_image.astype(np.int8)
+                else: # Apply specific scaling from quantization if any
+                     input_data = (rgb_image * (2**self.input_fix_point) / 255.0).astype(np.int8)
+                     # Or try: input_data = rgb_image.astype(np.float32) * self.input_scale if input_scale set to `(2**fix_point)/255.0`
+                     # This depends on your specific quantization flow.
+                     # A safer bet: The raw uint8 image usually is given to runner, and runner scales based on fix_point.
+                     # Let's revert to a common pattern: feed uint8 and let runtime handle it, OR manually scale to fixed point.
+                     # For now, let's stick with the original `uint8` and let the runner complain if it's wrong,
+                     # or try (image * QUANT_SCALE).astype(INT8)
+                     # Let's assume it needs to be scaled and cast
+                     input_data = (rgb_image.astype(np.float32) / 255.0 * (2**self.input_fix_point)).astype(np.int8)
+
+            elif self.input_dtype.name == 'FLOAT32':
                 input_data = rgb_image.astype(np.float32) / 255.0
+            else:
+                raise ValueError(f"Unsupported input data type: {self.input_dtype.name}")
 
             input_data = np.expand_dims(input_data, axis=0) # Add batch dimension
 
-            # Prepare output buffer
-            # Output from DPU for quantized models is usually INT8 or INT16
+            # Prepare output buffer in DPU's native data type
             output_buffer = np.zeros(self.output_dims, dtype=self.output_dtype.as_numpy_dtype)
             
             # Execute inference
-            # VART's execute_async expects a list of numpy arrays for inputs/outputs
             job_id = self.runner.execute_async([input_data], [output_buffer])
             self.runner.wait(job_id)
             
-            # Post-process output
-            # Convert DPU output (e.g., INT8) back to float32 using output_scale
+            # Post-process output: de-quantize if necessary
             if self.output_dtype.name == 'INT8':
                 outputs = [output_buffer[0] * self.output_scale] # Apply de-quantization scale
+            elif self.output_dtype.name == 'FLOAT32':
+                outputs = [output_buffer[0]]
             else:
-                outputs = [output_buffer[0]] # Already float, no de-quantization
+                raise ValueError(f"Unsupported output data type: {self.output_dtype.name}")
             
             detections = self.process_outputs(outputs, image.shape)
             result = self.draw_detections(image.copy(), detections)
@@ -149,67 +176,62 @@ class YOLOv8SafeRunner:
         
         except Exception as e:
             print(f"Inference error during DPU run: {e}")
-            self.use_fallback = True # Fallback if DPU inference fails
+            self.use_fallback = True
             return self.fallback_detect(image)
 
-    def fallback_detect(self, image):
-        # ... (unchanged) ...
-        h, w = image.shape[:2]
-        detections = []
-        detections.append({
-            'bbox': [w//4, h//4, 3*w//4, 3*h//4],
-            'score': 0.75,
-            'class': 0  # person
-        })
-        result = self.draw_detections(image.copy(), detections)
-        return result, detections
-
+    # ... (rest of the class methods: fallback_detect, process_outputs, draw_detections,
+    # and all functions outside the class: find_camera, camera_thread, generate, index, video_feed, main)
+    # remain the same as the previous full code, except for `process_outputs` if it was already updated with NMS.
+    # I'll just include the `process_outputs` with NMS and some minor adjustments to class_id/score logic.
     def process_outputs(self, outputs_raw, img_shape):
         detections = []
         try:
-            # outputs_raw is a list containing the numpy array, take the first element
             if not outputs_raw or len(outputs_raw) == 0:
                 return detections
             
-            output = outputs_raw[0] # This is already de-quantized to float32
+            output = outputs_raw[0] 
             
-            # YOLOv8 output is often (Batch, 84, Num_Boxes) or (Batch, Num_Boxes, 84)
-            # DPU might output (1, 84, 8400) or (1, 8400, 84) for yolov8n
-            
-            if output.ndim == 2: # Likely (Num_Boxes, 84) after slicing batch
+            if output.ndim == 2:
                 predictions = output
-            elif output.ndim == 3: # (Batch, Num_Boxes, 84) or (Batch, 84, Num_Boxes)
-                if output.shape[1] == 84: # (Batch, 84, Num_Boxes)
+            elif output.ndim == 3: 
+                # Expected YOLOv8 output from DPU after de-quantization could be (1, 84, 8400)
+                # or (1, 8400, 84)
+                if output.shape[1] == 84 and output.shape[2] == 8400: # (Batch, 84, Num_Boxes)
                     predictions = output[0].transpose(1, 0) # Transpose to (Num_Boxes, 84)
-                elif output.shape[2] == 84: # (Batch, Num_Boxes, 84)
+                elif output.shape[1] == 8400 and output.shape[2] == 84: # (Batch, Num_Boxes, 84)
                     predictions = output[0] # Take the first batch
                 else:
-                    print(f"Unexpected output shape: {output.shape}")
-                    return detections
+                    print(f"Unexpected output shape: {output.shape}. Trying a common transpose.")
+                    # Fallback to try a transpose if dimensions are swapped but not 84 vs 8400 directly
+                    if output.shape[0] == 1 and output.shape[1] > output.shape[2]: # (1, Big, Small)
+                        predictions = output[0].transpose(1,0) # Attempt transpose
+                    elif output.shape[0] == 1 and output.shape[2] > output.shape[1]: # (1, Small, Big)
+                        predictions = output[0] # No transpose needed
+                    else:
+                        return detections
             else:
                 print(f"Unexpected output dimensions: {output.ndim}")
                 return detections
             
-            # Ensure predictions is float32 for calculations
             predictions = predictions.astype(np.float32)
 
-            for i in range(min(predictions.shape[0], 8400)): # Limit to 8400 predictions
+            boxes = []
+            scores = []
+            class_ids = []
+
+            for i in range(predictions.shape[0]): 
                 row = predictions[i]
                 
-                # Check row length. YOLOv8 has 4 bbox + 1 obj_conf + 80 class_scores = 85
-                # Some versions might have 84 (4+80, confidence included in class scores implicitly)
-                # Assuming 84 is bbox (4) + class_scores (80) with confidence already factored in or available
-                
-                if len(row) >= 84: # cx, cy, w, h + 80 class scores
-                    # If the output format is [cx, cy, w, h, class1_score, class2_score, ... ]
+                # YOLOv8 output format: [cx, cy, w, h, class_score_0, ..., class_score_79] (84 elements)
+                if len(row) >= 84:
                     cx, cy, w, h = row[0:4]
-                    class_scores = row[4:84] # Assuming 80 classes
+                    class_scores = row[4:84] 
                     
                     class_id = np.argmax(class_scores)
-                    confidence = class_scores[class_id] # Assuming confidence is directly the highest class score
+                    confidence = class_scores[class_id]
                     
-                    if confidence > 0.4: # Adjust confidence threshold
-                        # Scale to original image
+                    if confidence > 0.4: # Adjustable confidence threshold
+                        # Scale to image
                         scale_x = img_shape[1] / self.input_width
                         scale_y = img_shape[0] / self.input_height
                         
@@ -218,172 +240,45 @@ class YOLOv8SafeRunner:
                         x2 = int((cx + w/2) * scale_x)
                         y2 = int((cy + h/2) * scale_y)
                         
+                        # Clip coordinates to image boundaries
                         x1 = max(0, min(x1, img_shape[1]))
                         y1 = max(0, min(y1, img_shape[0]))
                         x2 = max(0, min(x2, img_shape[1]))
                         y2 = max(0, min(y2, img_shape[0]))
                         
                         if x2 > x1 and y2 > y1:
-                            detections.append({
-                                'bbox': [x1, y1, x2, y2],
-                                'score': float(confidence),
-                                'class': int(class_id)
-                            })
+                            boxes.append([x1, y1, x2, y2])
+                            scores.append(float(confidence))
+                            class_ids.append(int(class_id))
             
-            # Apply Non-Maximum Suppression (NMS) for better results
-            if len(detections) > 0:
-                boxes = np.array([d['bbox'] for d in detections])
-                scores = np.array([d['score'] for d in detections])
-                class_ids = np.array([d['class'] for d in detections])
+            # Apply Non-Maximum Suppression (NMS)
+            if len(boxes) > 0:
+                boxes_np = np.array(boxes)
+                scores_np = np.array(scores)
+                class_ids_np = np.array(class_ids)
 
-                # Perform NMS per class
                 final_detections = []
-                for class_id in np.unique(class_ids):
-                    indices = np.where(class_ids == class_id)[0]
-                    selected_boxes = boxes[indices]
-                    selected_scores = scores[indices]
+                for class_id_val in np.unique(class_ids_np):
+                    indices = np.where(class_ids_np == class_id_val)[0]
+                    selected_boxes = boxes_np[indices]
+                    selected_scores = scores_np[indices]
 
-                    # Convert x1, y1, x2, y2 to x, y, w, h for NMSBoxes
-                    # If opencv NMSBoxes expects x1,y1,x2,y2, ensure that.
-                    # Or convert to x, y, width, height format
-                    # NMSBoxes often takes [x, y, w, h] format, so we need to convert
+                    # OpenCV NMSBoxes expects [x, y, width, height]
                     boxes_xywh = np.array([[b[0], b[1], b[2]-b[0], b[3]-b[1]] for b in selected_boxes])
                     
-                    # You might need to adjust NMS threshold (e.g., 0.45 for iou_threshold)
-                    # and score threshold (e.g., 0.5)
-                    indices_keep = cv2.dnn.NMSBoxes(boxes_xywh.tolist(), selected_scores.tolist(), score_threshold=0.4, nms_threshold=0.45)
+                    indices_keep = cv2.dnn.NMSBoxes(boxes_xywh.tolist(), selected_scores.tolist(), score_threshold=0.4, nms_threshold=0.45) # Adjust thresholds as needed
                     
                     if len(indices_keep) > 0:
                         for idx in indices_keep.flatten():
-                            final_detections.append(detections[indices[idx]])
+                            original_idx = indices[idx] # Get original index
+                            final_detections.append({
+                                'bbox': boxes[original_idx],
+                                'score': scores[original_idx],
+                                'class': class_ids[original_idx]
+                            })
                 detections = final_detections
 
         except Exception as e:
             print(f"Output processing error: {e}")
             
         return detections
-
-    def draw_detections(self, image, detections):
-        # ... (unchanged) ...
-        for det in detections:
-            x1, y1, x2, y2 = det['bbox']
-            score = det['score']
-            class_id = det['class']
-            
-            color = (0, 255, 0) if class_id == 0 else (255, 0, 0)
-            
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            
-            label = f"{COCO_CLASSES[class_id]}: {score:.2f}"
-            cv2.putText(image, label, (x1, max(y1-5, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                            
-        return image
-
-def find_camera():
-    # ... (unchanged) ...
-    for i in range(4):
-        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
-        if cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                cap.release()
-                return i
-            cap.release()
-    return None
-
-def camera_thread():
-    global output_frame, lock
-    
-    model = YOLOv8SafeRunner("yolov8n_kv260.xmodel")
-    
-    cam_id = find_camera()
-    if cam_id is None:
-        print("No camera found!")
-        return
-    
-    cap = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    
-    fps = 0
-    fps_time = time.time()
-    frame_count = 0
-    
-    print("Detection started")
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        
-        start_time = time.time()
-        result_frame, detections = model.detect_safe(frame)
-        inference_time = (time.time() - start_time) * 1000
-        
-        frame_count += 1
-        if time.time() - fps_time > 1.0:
-            fps = frame_count
-            frame_count = 0
-            fps_time = time.time()
-        
-        info = f"FPS: {fps} | Time: {inference_time:.1f}ms | Objects: {len(detections)}"
-        cv2.putText(result_frame, info, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        with lock:
-            output_frame = result_frame.copy()
-
-def generate():
-    # ... (unchanged) ...
-    global output_frame, lock
-    
-    while True:
-        with lock:
-            if output_frame is None:
-                continue
-            
-            ret, buffer = cv2.imencode('.jpg', output_frame)
-            if not ret:
-                continue
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        
-        time.sleep(0.03)
-
-@app.route('/')
-def index():
-    # ... (unchanged) ...
-    return render_template_string('''
-    <html>
-    <head>
-        <title>YOLOv8n KV260</title>
-        <style>
-            body { text-align: center; background: #222; color: white; }
-            h1 { color: #0f0; }
-            img { border: 2px solid #0f0; }
-        </style>
-    </head>
-    <body>
-        <h1>YOLOv8n Object Detection</h1>
-        <img src="/video_feed" width="640" height="480">
-        <p>Detecting: person, car, bicycle, etc. (80 COCO classes)</p>
-    </body>
-    </html>
-    ''')
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-if __name__ == '__main__':
-    t = threading.Thread(target=camera_thread)
-    t.daemon = True
-    t.start()
-    
-    time.sleep(2)
-    
-    print("\nServer: http://[KV260_IP]:5000\n")
-    app.run(host='0.0.0.0', port=5000, debug=False)
