@@ -1,388 +1,151 @@
 #!/usr/bin/env python3
 """
-YOLOv8n Object Detection - Data Type Error Bypass Version
+Debug version to diagnose why detections are not working
 """
 
-from flask import Flask, Response, render_template_string
 import cv2
 import numpy as np
-import threading
-import time
-import os
-import sys
-import ctypes
+import xir
+import vart
 
-# Critical environment setup
-os.environ['XLNX_VART_FIRMWARE'] = '/lib/firmware/xilinx/b4096_300m/binary_container_1.bin'
-os.environ['XILINX_XRT'] = '/usr'
-os.environ['XLNX_ENABLE_FINGERPRINT_CHECK'] = '0'
-os.environ['XLNX_ENABLE_STAT_MODE'] = '0'
-os.environ['OPENCV_VIDEOIO_PRIORITY_GSTREAMER'] = '0'
-
-# Import with specific error handling
-try:
-    import xir
-    import vart
-    print("DPU libraries imported")
-except:
-    print("Cannot import DPU libraries")
-    sys.exit(1)
-
-app = Flask(__name__)
-output_frame = None
-lock = threading.Lock()
-
-COCO_CLASSES = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", 
-    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", 
-    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", 
-    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", 
-    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", 
-    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", 
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", 
-    "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", 
-    "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", 
-    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
-
-class YOLOv8SafeRunner:
-    """Safe runner that bypasses data type issues"""
+def debug_model_outputs():
+    """Debug function to check model outputs"""
     
-    def __init__(self, model_path):
-        self.ready = False
-        self.model_path = model_path
+    print("="*60)
+    print("YOLOv8n Model Debug")
+    print("="*60)
+    
+    # Load model
+    model_path = "yolov8n_kv260.xmodel"
+    graph = xir.Graph.deserialize(model_path)
+    subgraphs = graph.get_root_subgraph().toposort_child_subgraph()
+    
+    # Find DPU subgraph
+    dpu_subgraph = None
+    for sg in subgraphs:
+        if sg.has_attr("device") and sg.get_attr("device").upper() == "DPU":
+            dpu_subgraph = sg
+            break
+    
+    runner = vart.Runner.create_runner(dpu_subgraph, "run")
+    input_tensors = runner.get_input_tensors()
+    output_tensors = runner.get_output_tensors()
+    
+    # Print tensor info
+    print("\nInput Tensor Info:")
+    for t in input_tensors:
+        print(f"  Name: {t.name}")
+        print(f"  Shape: {t.dims}")
+        print(f"  Type: {t.dtype.name}")
+        fix_point = t.get_attr("fix_point") if t.has_attr("fix_point") else 0
+        print(f"  Fix Point: {fix_point}")
+    
+    print("\nOutput Tensor Info:")
+    for i, t in enumerate(output_tensors):
+        print(f"\nOutput {i}:")
+        print(f"  Name: {t.name}")
+        print(f"  Shape: {t.dims}")
+        print(f"  Type: {t.dtype.name}")
+        fix_point = t.get_attr("fix_point") if t.has_attr("fix_point") else 0
+        print(f"  Fix Point: {fix_point}")
+    
+    # Create test image with obvious objects
+    test_img = np.ones((640, 640, 3), dtype=np.uint8) * 255  # White background
+    
+    # Draw black rectangle (person-like)
+    cv2.rectangle(test_img, (200, 100), (280, 400), (0, 0, 0), -1)
+    
+    # Draw gray rectangle (car-like)
+    cv2.rectangle(test_img, (400, 300), (550, 450), (128, 128, 128), -1)
+    
+    cv2.imwrite("debug_input.jpg", test_img)
+    print("\nSaved test image as debug_input.jpg")
+    
+    # Preprocess
+    rgb_img = cv2.cvtColor(test_img, cv2.COLOR_BGR2RGB)
+    
+    # Check input data type and scale
+    input_dtype = input_tensors[0].dtype
+    fix_point = input_tensors[0].get_attr("fix_point") if input_tensors[0].has_attr("fix_point") else 0
+    
+    if input_dtype.name == 'INT8':
+        input_scale = (2**fix_point) / 255.0
+        input_data = (rgb_img.astype(np.float32) * input_scale).astype(np.int8)
+        print(f"\nInput preprocessing: INT8, scale={input_scale:.6f}")
+        print(f"Input data range: [{input_data.min()}, {input_data.max()}]")
+    else:
+        input_scale = 1.0 / 255.0
+        input_data = rgb_img.astype(np.float32) * input_scale
+        print(f"\nInput preprocessing: FLOAT32, scale={input_scale:.6f}")
+        print(f"Input data range: [{input_data.min():.3f}, {input_data.max():.3f}]")
+    
+    input_data = np.expand_dims(input_data, axis=0)
+    
+    # Allocate output
+    output_dtype = output_tensors[0].dtype
+    output_buffer = np.zeros(output_tensors[0].dims, dtype=output_dtype.as_numpy_dtype)
+    
+    # Run inference
+    print("\nRunning inference...")
+    job_id = runner.execute_async([input_data], [output_buffer])
+    runner.wait(job_id)
+    
+    # Analyze output
+    print("\nRaw output analysis:")
+    print(f"Output shape: {output_buffer.shape}")
+    print(f"Output dtype: {output_buffer.dtype}")
+    print(f"Output range: [{output_buffer.min()}, {output_buffer.max()}]")
+    print(f"Output mean: {output_buffer.mean():.6f}")
+    print(f"Output std: {output_buffer.std():.6f}")
+    
+    # Check for dead output
+    if np.abs(output_buffer).max() < 0.001:
+        print("\n⚠️  WARNING: Output is nearly zero - possible quantization failure")
+    
+    # De-quantize if INT8
+    if output_dtype.name == 'INT8':
+        fix_point = output_tensors[0].get_attr("fix_point") if output_tensors[0].has_attr("fix_point") else 0
+        output_scale = 1.0 / (2**fix_point)
+        output_float = output_buffer.astype(np.float32) * output_scale
+        print(f"\nDe-quantized output (scale={output_scale:.6f}):")
+        print(f"Range: [{output_float.min():.3f}, {output_float.max():.3f}]")
+    else:
+        output_float = output_buffer
+    
+    # Check YOLOv8 output format
+    if len(output_buffer.shape) == 3:
+        batch, dim1, dim2 = output_buffer.shape
+        print(f"\nOutput interpretation:")
+        print(f"  Batch size: {batch}")
         
-        print(f"Loading model: {model_path}")
-        
-        try:
-            # Load graph
-            self.graph = xir.Graph.deserialize(model_path)
-            root = self.graph.get_root_subgraph()
-            children = root.toposort_child_subgraph()
+        if dim1 == 84 or dim2 == 84:
+            print("  ✓ Looks like YOLOv8 format (84 = 4 bbox + 80 classes)")
             
-            # Find DPU subgraph
-            self.dpu_subgraph = None
-            for sg in children:
-                if sg.has_attr("device") and sg.get_attr("device").upper() == "DPU":
-                    self.dpu_subgraph = sg
-                    print(f"Found DPU subgraph: {sg.get_name()}")
-                    break
-            
-            if not self.dpu_subgraph:
-                raise Exception("No DPU subgraph")
-            
-            # Try different runner creation methods
-            self.runner = None
-            
-            # Method 1: Standard creation with error bypass
-            try:
-                self.runner = vart.Runner.create_runner(self.dpu_subgraph, "run")
-                print("Runner created with standard method")
-            except Exception as e:
-                print(f"Standard runner failed: {e}")
-                
-                # Method 2: Try with different mode
-                try:
-                    self.runner = vart.Runner.create_runner(self.dpu_subgraph, "sim")
-                    print("Runner created with sim mode")
-                except:
-                    pass
-            
-            if self.runner is None:
-                print("Using fallback inference method")
-                self.use_fallback = True
+            # Transpose if needed
+            if dim1 == 84:
+                predictions = output_float[0].transpose(1, 0)
             else:
-                self.use_fallback = False
+                predictions = output_float[0]
+            
+            # Check for valid detections
+            print(f"\nChecking for detections (first 10 predictions):")
+            for i in range(min(10, predictions.shape[0])):
+                cx, cy, w, h = predictions[i, 0:4]
+                class_scores = predictions[i, 4:84]
+                max_score = class_scores.max()
+                class_id = class_scores.argmax()
                 
-                # Get tensor information safely
-                try:
-                    self.input_tensors = self.runner.get_input_tensors()
-                    self.output_tensors = self.runner.get_output_tensors()
-                    
-                    # Get dimensions without accessing problematic attributes
-                    if self.input_tensors:
-                        # Try to get dims
-                        try:
-                            self.input_dims = self.input_tensors[0].dims
-                        except:
-                            self.input_dims = [1, 640, 640, 3]  # Default
-                            
-                        print(f"Input dims: {self.input_dims}")
-                except Exception as e:
-                    print(f"Tensor info error: {e}")
-                    self.input_dims = [1, 640, 640, 3]
-            
-            self.ready = True
-            
-        except Exception as e:
-            print(f"Initialization error: {e}")
-            self.ready = False
-
-    def detect_safe(self, image):
-        """Safe detection with multiple fallbacks"""
-        
-        if not self.ready:
-            return image, []
-        
-        try:
-            # Preprocess
-            resized = cv2.resize(image, (640, 640))
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            
-            if self.use_fallback:
-                # Fallback: Simple detection simulation
-                return self.fallback_detect(image)
-            
-            # Prepare input - ensure uint8
-            input_data = np.expand_dims(rgb, axis=0).astype(np.uint8)
-            
-            # Method 1: Direct numpy arrays
-            try:
-                # Allocate output arrays
-                outputs = []
-                for i in range(len(self.output_tensors)):
-                    # Use safe default shape if dims access fails
-                    try:
-                        shape = tuple(self.output_tensors[i].dims)
-                    except:
-                        shape = (1, 8400, 84)  # YOLOv8 default
-                    
-                    out_array = np.zeros(shape, dtype=np.float32)
-                    outputs.append(out_array)
+                print(f"  Pred {i}: cx={cx:.3f}, cy={cy:.3f}, w={w:.3f}, h={h:.3f}, "
+                      f"max_score={max_score:.3f}, class={class_id}")
                 
-                # Execute with error handling
-                try:
-                    job_id = self.runner.execute_async(input_data, outputs)
-                    self.runner.wait(job_id)
-                except Exception as e:
-                    # Try synchronous execution
-                    try:
-                        outputs = self.runner.run([input_data])
-                    except:
-                        return self.fallback_detect(image)
-                
-                # Process outputs
-                detections = self.process_outputs(outputs, image.shape)
-                result = self.draw_detections(image.copy(), detections)
-                
-                return result, detections
-                
-            except Exception as e:
-                print(f"Inference error: {e}")
-                return self.fallback_detect(image)
-                
-        except Exception as e:
-            print(f"Detection error: {e}")
-            return image, []
-
-    def fallback_detect(self, image):
-        """Fallback detection for testing"""
-        # Simulate some detections for testing
-        h, w = image.shape[:2]
-        
-        # Create fake detections
-        detections = []
-        
-        # Always detect a "person" in center for testing
-        detections.append({
-            'bbox': [w//4, h//4, 3*w//4, 3*h//4],
-            'score': 0.75,
-            'class': 0  # person
-        })
-        
-        result = self.draw_detections(image.copy(), detections)
-        return result, detections
-
-    def process_outputs(self, outputs, img_shape):
-        """Safe output processing"""
-        detections = []
-        
-        try:
-            if not outputs or len(outputs) == 0:
-                return detections
-            
-            output = outputs[0]
-            
-            # Handle various shapes safely
-            if output.ndim == 3:
-                if output.shape[1] == 84:
-                    output = output.transpose(0, 2, 1)
-                predictions = output[0]
-            elif output.ndim == 2:
-                predictions = output
-            else:
-                return detections
-            
-            # Process predictions
-            for i in range(min(predictions.shape[0], 1000)):
-                row = predictions[i]
-                
-                if len(row) >= 84:
-                    cx, cy, w, h = row[0:4]
-                    obj_conf = row[4]
-                    class_scores = row[5:85]
-                    
-                    class_id = np.argmax(class_scores)
-                    confidence = obj_conf * class_scores[class_id]
-                    
-                    if confidence > 0.5:
-                        # Scale to image
-                        scale_x = img_shape[1] / 640
-                        scale_y = img_shape[0] / 640
-                        
-                        x1 = int((cx - w/2) * scale_x)
-                        y1 = int((cy - h/2) * scale_y)
-                        x2 = int((cx + w/2) * scale_x)
-                        y2 = int((cy + h/2) * scale_y)
-                        
-                        # Clip
-                        x1 = max(0, min(x1, img_shape[1]))
-                        y1 = max(0, min(y1, img_shape[0]))
-                        x2 = max(0, min(x2, img_shape[1]))
-                        y2 = max(0, min(y2, img_shape[0]))
-                        
-                        if x2 > x1 and y2 > y1:
-                            detections.append({
-                                'bbox': [x1, y1, x2, y2],
-                                'score': float(confidence),
-                                'class': int(class_id) % 80
-                            })
-                            
-        except Exception as e:
-            print(f"Output processing error: {e}")
-            
-        return detections
-
-    def draw_detections(self, image, detections):
-        """Draw boxes on image"""
-        for det in detections:
-            x1, y1, x2, y2 = det['bbox']
-            score = det['score']
-            class_id = det['class']
-            
-            # Color
-            color = (0, 255, 0) if class_id == 0 else (255, 0, 0)
-            
-            # Draw box
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            
-            # Label
-            label = f"{COCO_CLASSES[class_id]}: {score:.2f}"
-            cv2.putText(image, label, (x1, max(y1-5, 20)), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                       
-        return image
-
-def find_camera():
-    """Find camera"""
-    for i in range(4):
-        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
-        if cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                cap.release()
-                return i
-            cap.release()
-    return None
-
-def camera_thread():
-    """Main camera thread"""
-    global output_frame, lock
+                if max_score > 0.1:
+                    print(f"    → Potential detection!")
+        else:
+            print(f"  ⚠️  Unexpected dimensions: {dim1} x {dim2}")
     
-    # Initialize model
-    model = YOLOv8SafeRunner("yolov8n_kv260.xmodel")
-    
-    # Find camera
-    cam_id = find_camera()
-    if cam_id is None:
-        print("No camera found!")
-        return
-    
-    # Open camera
-    cap = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    
-    fps = 0
-    fps_time = time.time()
-    frame_count = 0
-    
-    print("Detection started")
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        
-        # Detect
-        start_time = time.time()
-        result_frame, detections = model.detect_safe(frame)
-        inference_time = (time.time() - start_time) * 1000
-        
-        # FPS
-        frame_count += 1
-        if time.time() - fps_time > 1.0:
-            fps = frame_count
-            frame_count = 0
-            fps_time = time.time()
-        
-        # Info
-        info = f"FPS: {fps} | Time: {inference_time:.1f}ms | Objects: {len(detections)}"
-        cv2.putText(result_frame, info, (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Update
-        with lock:
-            output_frame = result_frame.copy()
+    print("\n" + "="*60)
+    print("Debug complete. Check the output above for issues.")
+    print("="*60)
 
-def generate():
-    """MJPEG stream"""
-    global output_frame, lock
-    
-    while True:
-        with lock:
-            if output_frame is None:
-                continue
-            
-            ret, buffer = cv2.imencode('.jpg', output_frame)
-            if not ret:
-                continue
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        
-        time.sleep(0.03)
-
-@app.route('/')
-def index():
-    return render_template_string('''
-    <html>
-    <head>
-        <title>YOLOv8n KV260</title>
-        <style>
-            body { text-align: center; background: #222; color: white; }
-            h1 { color: #0f0; }
-            img { border: 2px solid #0f0; }
-        </style>
-    </head>
-    <body>
-        <h1>YOLOv8n Object Detection</h1>
-        <img src="/video_feed" width="640" height="480">
-        <p>Detecting: person, car, bicycle, etc. (80 COCO classes)</p>
-    </body>
-    </html>
-    ''')
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-if __name__ == '__main__':
-    # Start camera thread
-    t = threading.Thread(target=camera_thread)
-    t.daemon = True
-    t.start()
-    
-    time.sleep(2)
-    
-    print("\nServer: http://[KV260_IP]:5000\n")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+if __name__ == "__main__":
+    debug_model_outputs()
