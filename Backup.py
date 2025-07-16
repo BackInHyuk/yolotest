@@ -52,7 +52,6 @@ class YOLOv8_DPU:
         if not pathlib.Path(model_path).exists():
             raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
 
-        # --- [MODIFIED] More robust DPU Runner Initialization ---
         g = xir.Graph.deserialize(model_path)
         subgraphs = g.get_root_subgraph().get_children()
         dpu_subgraph = [s for s in subgraphs if s.get_attr("device") == "DPU"]
@@ -60,24 +59,41 @@ class YOLOv8_DPU:
             raise RuntimeError("모델에서 DPU 서브그래프를 찾을 수 없습니다.")
         
         self.runner = vart.Runner.create_runner(dpu_subgraph[0], "run")
-        # --- END OF MODIFICATION ---
         
         input_tensors = self.runner.get_input_tensors()
         output_tensors = self.runner.get_output_tensors()
         self.input_tensor = input_tensors[0]
         self.output_tensor = output_tensors[0]
-        self.input_scale = vart.get_input_scale(self.input_tensor)
-        self.output_scale = vart.get_output_scale(self.output_tensor)
+
+        # --- [MODIFIED] Replaced deprecated scale functions ---
+        # The vart.get_input_scale and vart.get_output_scale functions are not available
+        # in all VART versions. We get the scaling factor from the tensor's 'fix_point' attribute instead.
+        print("스케일 팩터를 텐서의 'fix_point' 속성에서 직접 가져옵니다.", flush=True)
+        input_fix_point = self.input_tensor.get_attr("fix_point")
+        self.input_scale = 2**input_fix_point
+
+        output_fix_point = self.output_tensor.get_attr("fix_point")
+        self.output_scale = 2**(-output_fix_point)
+        # --- END OF MODIFICATION ---
+        
         self.input_shape = tuple(self.input_tensor.dims)
         
         print(f"DPU가 초기화되었습니다:", flush=True)
         print(f"  - 모델: {model_path}", flush=True)
         print(f"  - 입력 형태: {self.input_shape}", flush=True)
         print(f"  - 출력 형태: {self.output_tensor.dims}", flush=True)
+        print(f"  - 계산된 입력 스케일: {self.input_scale}", flush=True)
+        print(f"  - 계산된 출력 스케일: {self.output_scale}", flush=True)
 
     def preprocess(self, frame):
+        # --- [MODIFIED] Corrected preprocessing step ---
+        # Resize the frame to the model's input size
         img = cv2.resize(frame, (self.input_shape[2], self.input_shape[1]))
+        # Normalize pixel values from [0, 255] to [0, 1]
+        img = img / 255.0
+        # Apply the scaling factor and cast to the DPU input type (int8)
         img = (img * self.input_scale).astype(np.int8)
+        # --- END OF MODIFICATION ---
         return np.expand_dims(img, 0)
 
     def postprocess(self, dpu_output, original_shape):
@@ -144,7 +160,6 @@ def capture_frames():
         print("DPU 핸들러 초기화를 시도합니다...", flush=True)
         yolo_detector = YOLOv8_DPU(MODEL_PATH)
     except Exception as e:
-        # --- [MODIFIED] Detailed Error Logging ---
         print("="*50, flush=True)
         print("!!! DPU 초기화 중 심각한 오류 발생 !!!", flush=True)
         print(f"오류 종류: {type(e).__name__}", flush=True)
@@ -153,7 +168,6 @@ def capture_frames():
         traceback.print_exc()
         print("="*50, flush=True)
         print("탐지 기능 없이 원본 카메라 영상만 스트리밍합니다.", flush=True)
-        # --- END OF MODIFICATION ---
 
     cap = cv2.VideoCapture(CAMERA_DEVICE)
     if not cap.isOpened():
