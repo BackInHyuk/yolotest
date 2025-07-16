@@ -11,10 +11,10 @@ import threading
 import time
 import numpy as np
 import vart
-import xir # VART 실행기 생성을 위해 xir 라이브러리 추가
+import xir # For VART runner creation
 import pathlib
 import os
-import traceback # 상세한 오류 출력을 위해 traceback 라이브러리 추가
+import traceback # For detailed error logging
 
 # --- Configuration ---
 MODEL_PATH = "yolov8n_kv260.xmodel" # IMPORTANT: Set the correct path to your compiled model
@@ -47,16 +47,15 @@ class YOLOv8_DPU:
     def __init__(self, model_path):
         """
         Initializes the DPU runner for the YOLOv8 model.
-        Uses a more robust method to be compatible with different VART versions.
         """
         if not pathlib.Path(model_path).exists():
-            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
+            raise FileNotFoundError(f"Model file not found: {model_path}")
 
         g = xir.Graph.deserialize(model_path)
         subgraphs = g.get_root_subgraph().get_children()
         dpu_subgraph = [s for s in subgraphs if s.get_attr("device") == "DPU"]
         if not dpu_subgraph:
-            raise RuntimeError("모델에서 DPU 서브그래프를 찾을 수 없습니다.")
+            raise RuntimeError("Could not find DPU subgraph in the model.")
         
         self.runner = vart.Runner.create_runner(dpu_subgraph[0], "run")
         
@@ -65,35 +64,26 @@ class YOLOv8_DPU:
         self.input_tensor = input_tensors[0]
         self.output_tensor = output_tensors[0]
 
-        # --- [MODIFIED] Replaced deprecated scale functions ---
-        # The vart.get_input_scale and vart.get_output_scale functions are not available
-        # in all VART versions. We get the scaling factor from the tensor's 'fix_point' attribute instead.
-        print("스케일 팩터를 텐서의 'fix_point' 속성에서 직접 가져옵니다.", flush=True)
+        print("Getting scaling factors directly from tensor 'fix_point' attribute.", flush=True)
         input_fix_point = self.input_tensor.get_attr("fix_point")
         self.input_scale = 2**input_fix_point
 
         output_fix_point = self.output_tensor.get_attr("fix_point")
         self.output_scale = 2**(-output_fix_point)
-        # --- END OF MODIFICATION ---
         
         self.input_shape = tuple(self.input_tensor.dims)
         
-        print(f"DPU가 초기화되었습니다:", flush=True)
-        print(f"  - 모델: {model_path}", flush=True)
-        print(f"  - 입력 형태: {self.input_shape}", flush=True)
-        print(f"  - 출력 형태: {self.output_tensor.dims}", flush=True)
-        print(f"  - 계산된 입력 스케일: {self.input_scale}", flush=True)
-        print(f"  - 계산된 출력 스케일: {self.output_scale}", flush=True)
+        print(f"DPU initialized successfully:", flush=True)
+        print(f"  - Model: {model_path}", flush=True)
+        print(f"  - Input Shape: {self.input_shape}", flush=True)
+        print(f"  - Output Shape: {self.output_tensor.dims}", flush=True)
+        print(f"  - Calculated Input Scale: {self.input_scale}", flush=True)
+        print(f"  - Calculated Output Scale: {self.output_scale}", flush=True)
 
     def preprocess(self, frame):
-        # --- [MODIFIED] Corrected preprocessing step ---
-        # Resize the frame to the model's input size
         img = cv2.resize(frame, (self.input_shape[2], self.input_shape[1]))
-        # Normalize pixel values from [0, 255] to [0, 1]
         img = img / 255.0
-        # Apply the scaling factor and cast to the DPU input type (int8)
         img = (img * self.input_scale).astype(np.int8)
-        # --- END OF MODIFICATION ---
         return np.expand_dims(img, 0)
 
     def postprocess(self, dpu_output, original_shape):
@@ -139,16 +129,24 @@ class YOLOv8_DPU:
         return frame
 
     def run(self, frame):
-        original_shape = frame.shape[:2]
+        print("[RUN] Starting preprocessing...", flush=True)
         preprocessed_frame = self.preprocess(frame)
+        
+        print("[RUN] Preparing I/O buffers...", flush=True)
         input_data = [preprocessed_frame]
         output_data = [np.empty(self.output_tensor.dims, dtype=np.float32)]
 
+        print("[RUN] Executing DPU runner...", flush=True)
         job_id = self.runner.execute_async(input_data, output_data)
         self.runner.wait(job_id)
+        print("[RUN] DPU execution finished.", flush=True)
 
         raw_output = output_data[0] * self.output_scale
-        detections = self.postprocess(raw_output, original_shape)
+        
+        print("[RUN] Postprocessing output...", flush=True)
+        detections = self.postprocess(raw_output, frame.shape[:2])
+        
+        print("[RUN] Drawing detections...", flush=True)
         processed_frame = self.draw_detections(frame, detections)
         return processed_frame
 
@@ -157,24 +155,24 @@ def capture_frames():
     global output_frame, lock
     yolo_detector = None
     try:
-        print("DPU 핸들러 초기화를 시도합니다...", flush=True)
+        print("Attempting to initialize DPU handler...", flush=True)
         yolo_detector = YOLOv8_DPU(MODEL_PATH)
     except Exception as e:
         print("="*50, flush=True)
-        print("!!! DPU 초기화 중 심각한 오류 발생 !!!", flush=True)
-        print(f"오류 종류: {type(e).__name__}", flush=True)
-        print(f"오류 메시지: {e}", flush=True)
-        print("--- 상세 오류 정보 (Traceback) ---", flush=True)
+        print("!!! FATAL ERROR during DPU initialization !!!", flush=True)
+        print(f"Error Type: {type(e).__name__}", flush=True)
+        print(f"Error Message: {e}", flush=True)
+        print("--- Traceback ---", flush=True)
         traceback.print_exc()
         print("="*50, flush=True)
-        print("탐지 기능 없이 원본 카메라 영상만 스트리밍합니다.", flush=True)
+        print("Streaming will continue with raw camera feed (no detection).", flush=True)
 
     cap = cv2.VideoCapture(CAMERA_DEVICE)
     if not cap.isOpened():
-        print(f"오류: 카메라 장치({CAMERA_DEVICE})를 열 수 없습니다.", flush=True)
+        print(f"ERROR: Could not open camera device {CAMERA_DEVICE}", flush=True)
         return
 
-    print("카메라 캡처를 시작합니다...", flush=True)
+    print("Starting camera capture loop...", flush=True)
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -183,9 +181,10 @@ def capture_frames():
         
         if yolo_detector:
             try:
+                # print("[LOOP] Calling yolo_detector.run()", flush=True)
                 processed_frame = yolo_detector.run(frame)
             except Exception as e:
-                print(f"추론 중 오류 발생: {e}", flush=True)
+                print(f"ERROR during inference: {e}", flush=True)
                 processed_frame = frame 
         else:
             processed_frame = frame
@@ -231,5 +230,5 @@ if __name__ == '__main__':
     capture_thread.daemon = True
     capture_thread.start()
     
-    print("Flask 서버를 시작합니다... http://<your_kv260_ip>:5000 에서 접속하세요.", flush=True)
+    print("Starting Flask server... Access at http://<your_kv260_ip>:5000", flush=True)
     app.run(host='0.0.0.0', port=5000, threaded=True)
