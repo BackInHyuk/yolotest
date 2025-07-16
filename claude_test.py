@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Debug version to diagnose why detections are not working
+Debug version - Fixed
 """
+
+import os
+os.environ['XLNX_VART_FIRMWARE'] = '/lib/firmware/xilinx/b4096_300m/binary_container_1.bin'
 
 import cv2
 import numpy as np
@@ -36,7 +39,7 @@ def debug_model_outputs():
     for t in input_tensors:
         print(f"  Name: {t.name}")
         print(f"  Shape: {t.dims}")
-        print(f"  Type: {t.dtype.name}")
+        print(f"  Type: {t.dtype}")  # dtype.name 제거
         fix_point = t.get_attr("fix_point") if t.has_attr("fix_point") else 0
         print(f"  Fix Point: {fix_point}")
     
@@ -45,45 +48,40 @@ def debug_model_outputs():
         print(f"\nOutput {i}:")
         print(f"  Name: {t.name}")
         print(f"  Shape: {t.dims}")
-        print(f"  Type: {t.dtype.name}")
+        print(f"  Type: {t.dtype}")  # dtype.name 제거
         fix_point = t.get_attr("fix_point") if t.has_attr("fix_point") else 0
         print(f"  Fix Point: {fix_point}")
     
-    # Create test image with obvious objects
-    test_img = np.ones((640, 640, 3), dtype=np.uint8) * 255  # White background
-    
-    # Draw black rectangle (person-like)
+    # Create test image
+    test_img = np.ones((640, 640, 3), dtype=np.uint8) * 255
     cv2.rectangle(test_img, (200, 100), (280, 400), (0, 0, 0), -1)
-    
-    # Draw gray rectangle (car-like)
     cv2.rectangle(test_img, (400, 300), (550, 450), (128, 128, 128), -1)
-    
     cv2.imwrite("debug_input.jpg", test_img)
     print("\nSaved test image as debug_input.jpg")
     
     # Preprocess
     rgb_img = cv2.cvtColor(test_img, cv2.COLOR_BGR2RGB)
     
-    # Check input data type and scale
+    # Check input data type
     input_dtype = input_tensors[0].dtype
     fix_point = input_tensors[0].get_attr("fix_point") if input_tensors[0].has_attr("fix_point") else 0
     
-    if input_dtype.name == 'INT8':
+    # Simple type check
+    if str(input_dtype).upper().find('INT8') >= 0:
         input_scale = (2**fix_point) / 255.0
         input_data = (rgb_img.astype(np.float32) * input_scale).astype(np.int8)
         print(f"\nInput preprocessing: INT8, scale={input_scale:.6f}")
-        print(f"Input data range: [{input_data.min()}, {input_data.max()}]")
     else:
         input_scale = 1.0 / 255.0
         input_data = rgb_img.astype(np.float32) * input_scale
         print(f"\nInput preprocessing: FLOAT32, scale={input_scale:.6f}")
-        print(f"Input data range: [{input_data.min():.3f}, {input_data.max():.3f}]")
     
+    print(f"Input data range: [{input_data.min()}, {input_data.max()}]")
     input_data = np.expand_dims(input_data, axis=0)
     
     # Allocate output
-    output_dtype = output_tensors[0].dtype
-    output_buffer = np.zeros(output_tensors[0].dims, dtype=output_dtype.as_numpy_dtype)
+    output_shape = output_tensors[0].dims
+    output_buffer = np.zeros(output_shape, dtype=np.float32)  # 기본적으로 float32 사용
     
     # Run inference
     print("\nRunning inference...")
@@ -93,7 +91,6 @@ def debug_model_outputs():
     # Analyze output
     print("\nRaw output analysis:")
     print(f"Output shape: {output_buffer.shape}")
-    print(f"Output dtype: {output_buffer.dtype}")
     print(f"Output range: [{output_buffer.min()}, {output_buffer.max()}]")
     print(f"Output mean: {output_buffer.mean():.6f}")
     print(f"Output std: {output_buffer.std():.6f}")
@@ -102,30 +99,21 @@ def debug_model_outputs():
     if np.abs(output_buffer).max() < 0.001:
         print("\n⚠️  WARNING: Output is nearly zero - possible quantization failure")
     
-    # De-quantize if INT8
-    if output_dtype.name == 'INT8':
-        fix_point = output_tensors[0].get_attr("fix_point") if output_tensors[0].has_attr("fix_point") else 0
-        output_scale = 1.0 / (2**fix_point)
-        output_float = output_buffer.astype(np.float32) * output_scale
-        print(f"\nDe-quantized output (scale={output_scale:.6f}):")
-        print(f"Range: [{output_float.min():.3f}, {output_float.max():.3f}]")
-    else:
-        output_float = output_buffer
-    
     # Check YOLOv8 output format
     if len(output_buffer.shape) == 3:
         batch, dim1, dim2 = output_buffer.shape
         print(f"\nOutput interpretation:")
         print(f"  Batch size: {batch}")
+        print(f"  Dimensions: {dim1} x {dim2}")
         
         if dim1 == 84 or dim2 == 84:
             print("  ✓ Looks like YOLOv8 format (84 = 4 bbox + 80 classes)")
             
             # Transpose if needed
             if dim1 == 84:
-                predictions = output_float[0].transpose(1, 0)
+                predictions = output_buffer[0].transpose(1, 0)
             else:
-                predictions = output_float[0]
+                predictions = output_buffer[0]
             
             # Check for valid detections
             print(f"\nChecking for detections (first 10 predictions):")
@@ -140,12 +128,6 @@ def debug_model_outputs():
                 
                 if max_score > 0.1:
                     print(f"    → Potential detection!")
-        else:
-            print(f"  ⚠️  Unexpected dimensions: {dim1} x {dim2}")
-    
-    print("\n" + "="*60)
-    print("Debug complete. Check the output above for issues.")
-    print("="*60)
 
 if __name__ == "__main__":
     debug_model_outputs()
