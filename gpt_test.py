@@ -1,170 +1,158 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-yolov8_multi_cam_recursive.py
-
-KV260 + PetaLinux 2023.1 환경에서,
-/home/petalinux/yolotest/yolov8n_kv260.xmodel (멀티 DPU SG) 모델로
-USB UVC 카메라 스트리밍 → 모든 COCO 클래스 탐지 + 바운딩박스
-
-사용법:
-  sudo python3 -m pip install opencv-python numpy
-  chmod +x yolov8_multi_cam_recursive.py
-  ./yolov8_multi_cam_recursive.py
+YOLOX-Nano + MJPEG HTTP 스트리밍 (Flask)
+보드 IP: 192.168.x.x 라면 ⇒  http://192.168.x.x:5000  접속
 """
 
-import cv2
-import numpy as np
-import xir
-import vart
-import time
-import sys
+import os, cv2, time, random, colorsys, numpy as np, threading
+from flask import Flask, Response, render_template_string
+import xir, vitis_ai_library
 
-# 사용자 설정
-MODEL_PATH   = "/home/petalinux/yolotest/yolov8n_kv260.xmodel"
-INPUT_SIZE   = (640, 640)  # 컴파일 시 지정한 입력 해상도
-CONF_THRES   = 0.25
-NMS_THRES    = 0.45
-CAMERA_INDEX = 0         # /dev/video0
+# ────────────────────── 환경 설정 ──────────────────────
+XMODEL   = "yolox_nano_pt.xmodel"
+LABELS   = "img/coco2017_classes.txt"
+IN_SIZE  = (416, 416)
+CLASS_TH = 0.30
+NMS_TH   = 0.45
+NMS_SCTH = 0.10
+CAM_ID   = 0           # USB 웹캠 번호
+FPS_CAP  = 30          # Webcam 프레임 제한(없으면 0)
 
-# COCO 클래스 이름 (0부터 79)
-COCO_CLASSES = (
-    "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat",
-    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
-    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
-    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
-    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
-    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
-    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair",
-    "sofa","pottedplant","bed","diningtable","toilet","tvmonitor","laptop","mouse",
-    "remote","keyboard","cell phone","microwave","oven","toaster","sink","refrigerator",
-    "book","clock","vase","scissors","teddy bear","hair drier","toothbrush"
-)
+# ────────────────────── 클래스 이름 로드 ──────────────────────
+with open(LABELS) as f:
+    CLASSES = [l.strip() for l in f]
 
-def find_dpu_subgraphs(sg, out):
-    """재귀 탐색으로 DPU 서브그래프만 골라내기"""
-    if sg.has_attr("device") and sg.get_attr("device") == "DPU":
-        out.append(sg)
-    for c in sg.get_children():
-        find_dpu_subgraphs(c, out)
+# ────────────────────── 전/후처리 함수 (필요 부분만) ──────────────────────
+def preprocess(img, size):
+    pad = np.ones((size[0], size[1], 3), dtype=np.uint8) * 114
+    r = min(size[0]/img.shape[0], size[1]/img.shape[1])
+    rs = cv2.resize(img, (int(img.shape[1]*r), int(img.shape[0]*r)),
+                    interpolation=cv2.INTER_LINEAR).astype(np.uint8)
+    pad[:rs.shape[0], :rs.shape[1]] = rs
+    return np.ascontiguousarray(pad, dtype=np.float32), r
 
-def initialize_dpu(model_path):
-    # 1) Graph 로드
-    graph = xir.Graph.deserialize(model_path)
-    root  = graph.get_root_subgraph()
+def sigmoid(x): return 1/(1+np.exp(-x))
+def softmax(x): e=np.exp(x - np.max(x)); return e/e.sum(axis=-1, keepdims=True)
 
-    # 2) 재귀 탐색으로 DPU 서브그래프 수집
-    subgraphs = []
-    find_dpu_subgraphs(root, subgraphs)
-    if not subgraphs:
-        print("Error: DPU 서브그래프를 찾을 수 없습니다.", file=sys.stderr)
-        sys.exit(1)
-    print(f"[INFO] Found {len(subgraphs)} DPU subgraph(s).")
+def nms(boxes, scores, thr):
+    x1, y1, x2, y2 = boxes.T
+    area = (x2-x1+1)*(y2-y1+1)
+    order = scores.argsort()[::-1]
+    keep=[]
+    while order.size:
+        i=order[0]; keep.append(i)
+        xx1=np.maximum(x1[i],x1[order[1:]]); yy1=np.maximum(y1[i],y1[order[1:]])
+        xx2=np.minimum(x2[i],x2[order[1:]]); yy2=np.minimum(y2[i],y2[order[1:]])
+        w=np.maximum(0., xx2-xx1+1); h=np.maximum(0., yy2-yy1+1)
+        inter=w*h; ovr=inter/(area[i]+area[order[1:]]-inter)
+        inds=np.where(ovr<=thr)[0]; order=order[inds+1]
+    return keep
 
-    # 3) Runner 생성 & 입출력 버퍼 준비
-    runners, io = [], []
-    for sg in subgraphs:
-        r = vart.Runner.create_runner(sg, "run")
-        runners.append(r)
-        in_t  = r.get_input_tensors()[0]
-        out_t = r.get_output_tensors()[0]
-        io.append({
-            "in":  np.empty(in_t.dims,  dtype=np.int8,    order='C'),
-            "out": np.empty(out_t.dims, dtype=np.float32, order='C')
-        })
-    return runners, io
-
-def preprocess(frame):
-    # BGR→RGB, 리사이즈, uint8→int8(-128~127), shape=(1,C,H,W)
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, INPUT_SIZE)
-    img = img.astype(np.int8) - 128
-    return np.expand_dims(img, axis=0)
-
-def run_dpu(runners, io, frame):
-    # 첫 서브그래프 입력
-    io[0]["in"][...] = preprocess(frame)
-    # 순차 실행 및 중간 버퍼 연결
-    for i, r in enumerate(runners):
-        job_id = r.execute_async([io[i]["in"]], [io[i]["out"]])
-        r.wait(job_id)
-        if i+1 < len(runners):
-            io[i+1]["in"][...] = io[i]["out"]
-    return io[-1]["out"]
-
-def postprocess(raw_out, orig_shape):
-    # raw_out → (N,6): [x1,y1,x2,y2,conf,class]
-    preds = raw_out.reshape(-1, 6)
-    # confidence 필터
-    mask = preds[:,4] > CONF_THRES
-    preds = preds[mask]
-
-    boxes     = preds[:, :4]
-    scores    = preds[:, 4]
-    class_ids = preds[:, 5].astype(int)
-
-    idxs = cv2.dnn.NMSBoxes(
-        boxes.tolist(), scores.tolist(),
-        CONF_THRES, NMS_THRES
-    )
-    if len(idxs) == 0:
-        return []
-
-    h, w = orig_shape[:2]
-    scale = np.array([w, h, w, h], dtype=np.float32) / INPUT_SIZE
-    dets = []
-    for i in idxs.flatten():
-        x1, y1, x2, y2 = (boxes[i] * scale).astype(int)
-        conf = float(scores[i])
-        cls  = class_ids[i]
-        name = COCO_CLASSES[cls] if cls < len(COCO_CLASSES) else str(cls)
-        dets.append((x1, y1, x2, y2, conf, name))
+def postprocess(outputs, img_size, r, w, h):
+    p6=False; strides=[8,16,32] if not p6 else [8,16,32,64]
+    hs=[img_size[0]//s for s in strides]; ws=[img_size[1]//s for s in strides]
+    grids=[]; exps=[]
+    for hsize,wsize,s in zip(hs,ws,strides):
+        yv,xv=np.meshgrid(np.arange(hsize),np.arange(wsize))
+        grid=np.stack((xv,yv),2).reshape(1,-1,2); grids.append(grid)
+        shape=grid.shape[:2]; exps.append(np.full((*shape,1), s))
+    grids=np.concatenate(grids,1); exps=np.concatenate(exps,1)
+    outputs[...,:2]=(outputs[...,:2]+grids)*exps
+    outputs[...,2:4]=np.exp(outputs[...,2:4])*exps
+    pred=outputs[0]; boxes=pred[:,:4]
+    scores=sigmoid(pred[:,4:5])*softmax(pred[:,5:])
+    xyxy=np.empty_like(boxes)
+    xyxy[:,0]=boxes[:,0]-boxes[:,2]/2; xyxy[:,1]=boxes[:,1]-boxes[:,3]/2
+    xyxy[:,2]=boxes[:,0]+boxes[:,2]/2; xyxy[:,3]=boxes[:,1]+boxes[:,3]/2
+    xyxy/=r
+    cls_ids=scores.argmax(1); cls_scores=scores[np.arange(len(cls_ids)),cls_ids]
+    mask=cls_scores>CLASS_TH
+    if not mask.any(): return np.empty((0,6))
+    xyxy,cls_scores,cls_ids = xyxy[mask],cls_scores[mask],cls_ids[mask]
+    keep=nms(xyxy,cls_scores,NMS_TH)
+    dets=np.concatenate([xyxy[keep], cls_scores[keep,None], cls_ids[keep,None]],1)
+    dets[:,0]=np.clip(dets[:,0],0,w); dets[:,1]=np.clip(dets[:,1],0,h)
+    dets[:,2]=np.clip(dets[:,2],0,w); dets[:,3]=np.clip(dets[:,3],0,h)
     return dets
 
-def draw_detections(frame, dets):
-    for x1, y1, x2, y2, conf, name in dets:
-        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-        cv2.putText(
-            frame, f"{name} {conf:.2f}",
-            (x1, max(y1-5,0)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1
-        )
+def draw_bbox(img, dets):
+    if not len(dets): return img
+    n_cls=len(CLASSES)
+    hsv=[(x/n_cls,1,1) for x in range(n_cls)]
+    rgb=[tuple(int(c*255) for c in colorsys.hsv_to_rgb(*h)) for h in hsv]
+    random.seed(0); random.shuffle(rgb)
+    h,w,_=img.shape; thick=max(1,int(1.2*(h+w)/600))
+    for x1,y1,x2,y2,sc,ci in dets:
+        color=rgb[int(ci)]; cv2.rectangle(img,(int(x1),int(y1)),(int(x2),int(y2)),color,thick)
+        label=f"{CLASSES[int(ci)]}:{sc:.2f}"
+        t_size=cv2.getTextSize(label,0,0.5,thick//2)[0]
+        cv2.rectangle(img,(int(x1),int(y1)-t_size[1]-4),(int(x1)+t_size[0],int(y1)),color,-1)
+        cv2.putText(img,label,(int(x1),int(y1)-2),0,0.5,(0,0,0),thick//2,cv2.LINE_AA)
+    return img
 
-def main():
-    runners, io = initialize_dpu(MODEL_PATH)
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print(f"Error: 카메라({CAMERA_INDEX})를 열 수 없습니다.", file=sys.stderr)
-        sys.exit(1)
+# ────────────────────── DPU 러너 1회 초기화 ──────────────────────
+graph   = xir.Graph.deserialize(XMODEL)
+runner  = vitis_ai_library.GraphRunner.create_graph_runner(graph)
+in_t    = runner.get_input_tensors()[0]
+out_ts  = runner.get_output_tensors()
+in_shape=tuple(in_t.dims)
+inp_buf = [np.empty(in_shape, dtype=np.float32, order='C')]
+out_buf = [np.empty(tuple(t.dims), dtype=np.float32, order='C') for t in out_ts]
 
-    fps, t0 = 0, time.time()
-    window = "YOLOv8 Multi-Class Detection"
-    cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+# ────────────────────── 글로벌 프레임 (스트리밍 공유) ──────────────────────
+latest_jpeg = None
+lock = threading.Lock()
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+# ────────────────────── 추론 스레드 ──────────────────────
+def infer_loop():
+    global latest_jpeg
+    cap=cv2.VideoCapture(CAM_ID)
+    if FPS_CAP: cap.set(cv2.CAP_PROP_FPS, FPS_CAP)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+        h,w=frame.shape[:2]
+        blob,r = preprocess(frame, IN_SIZE)
+        inp_buf[0][0,...]=blob.transpose(2,0,1)  # NCHW
+        jid=runner.execute_async(inp_buf, out_buf); runner.wait(jid)
+        outs=np.concatenate([o.reshape(1,-1,o.shape[-1]) for o in out_buf],1)
+        dets=postprocess(outs, IN_SIZE, r, w, h)
+        vis=draw_bbox(frame.copy(), dets)
+        _, jpeg=cv2.imencode('.jpg', vis, [int(cv2.IMWRITE_JPEG_QUALITY),80])
+        with lock:
+            latest_jpeg=jpeg.tobytes()
+    cap.release()
 
-            raw  = run_dpu(runners, io, frame)
-            dets = postprocess(raw, frame.shape)
-            draw_detections(frame, dets)
+threading.Thread(target=infer_loop, daemon=True).start()
 
-            fps += 1
-            if time.time() - t0 >= 1.0:
-                cv2.putText(
-                    frame, f"FPS: {fps}",
-                    (10,30), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0, (0,255,255), 2
-                )
-                fps, t0 = 0, time.time()
+# ────────────────────── Flask 서버 ──────────────────────
+app = Flask(__name__)
 
-            cv2.imshow(window, frame)
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
+HTML = """
+<!doctype html><title>YOLOX Stream</title>
+<h2 style="text-align:center;">YOLOX-Nano DPU 실시간 스트리밍</h2>
+<img src="/video_feed" style="display:block;margin:auto;max-width:100%;">
+"""
 
-if __name__ == "__main__":
-    main()
+@app.route('/')
+def index(): return render_template_string(HTML)
+
+def mjpeg_generator():
+    while True:
+        with lock:
+            frame = latest_jpeg
+        if frame:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        time.sleep(0.01)   # 100 FPS 이상 보내지 않도록
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(mjpeg_generator(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# ────────────────────── 메인 ──────────────────────
+if __name__ == '__main__':
+    # 0.0.0.0 로 열어야 외부(호스트 PC)에서 접속 가능
+    app.run(host='0.0.0.0', port=5000, threaded=True)
