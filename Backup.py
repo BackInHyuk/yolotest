@@ -536,7 +536,7 @@ class UltraSafeWebApp:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='yolox_nano_pt.xmodel')
+    parser.add_argument('--model', default='yolov8n_kv260.xmodel')
     parser.add_argument('--camera', type=int, default=0)
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5000)
